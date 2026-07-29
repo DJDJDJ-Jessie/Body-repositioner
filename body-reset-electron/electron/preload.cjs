@@ -1,0 +1,21 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('bodyReset', {
+  getState: () => ipcRenderer.invoke('app:get-state'),
+  saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
+  chooseVideoFolder: () => ipcRenderer.invoke('videos:choose-folder'),
+  openVideoFolder: () => ipcRenderer.invoke('videos:open-folder'),
+  scanVideos: () => ipcRenderer.invoke('videos:scan'),
+  addFocusTime: (ms) => ipcRenderer.invoke('stats:add-focus-time', ms),
+  getStatsTable: (period) => ipcRenderer.invoke('stats:get-table', period),
+  beginReset: () => ipcRenderer.invoke('reset:begin'),
+  getResetPayload: () => ipcRenderer.invoke('reset:get-payload'),
+  completeReset: (payload) => ipcRenderer.invoke('reset:complete', payload),
+  emergencyCloseReset: () => ipcRenderer.invoke('reset:emergency-close'),
+  setAutoStart: (enabled) => ipcRenderer.invoke('app:set-auto-start', enabled),
+  onResetCompleted: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('reset:completed', listener);
+    return () => ipcRenderer.removeListener('reset:completed', listener);
+  },
+});

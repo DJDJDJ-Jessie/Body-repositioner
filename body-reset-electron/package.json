@@ -1,0 +1,62 @@
+{
+  "name": "body-reset-electron",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "dev:ui": "vite --host 127.0.0.1",
+    "start": "electron .",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "pack": "npm run build && electron-builder --dir --win --x64 --config.electronDist=node_modules/electron/dist",
+    "dist": "npm run build && electron-builder --win portable --x64",
+    "dist:folder": "npm run pack"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.27.0",
+    "vue": "^3.5.39"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.13.2",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "@vue/tsconfig": "^0.9.1",
+    "concurrently": "^10.0.4",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0.2",
+    "vite": "^8.1.1",
+    "vue-tsc": "^3.3.8",
+    "wait-on": "^9.1.0"
+  },
+  "build": {
+    "appId": "local.body-reset-reminder",
+    "productName": "\u8eab\u4f53\u590d\u4f4d\u63d0\u9192\u5668",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "\u8eab\u4f53\u590d\u4f4d\u63d0\u9192\u5668.exe"
+    },
+    "portable": {
+      "artifactName": "\u8eab\u4f53\u590d\u4f4d\u63d0\u9192\u5668.exe"
+    }
+  }
+}
