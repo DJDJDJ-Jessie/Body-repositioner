@@ -15,6 +15,7 @@ release/
 dist-ssr/
 *.tsbuildinfo
 *.local
+*.zip
 
 # Logs
 logs/

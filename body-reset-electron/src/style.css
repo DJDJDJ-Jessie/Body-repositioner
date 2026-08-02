@@ -910,6 +910,66 @@ p {
   accent-color: var(--accent);
 }
 
+.setting-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(232, 241, 236, 0.42);
+  transition: opacity 160ms ease;
+}
+
+.setting-group.disabled {
+  opacity: 0.48;
+  pointer-events: none;
+}
+
+.setting-group-title {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.setting-help,
+.sync-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.sync-status.error {
+  color: #a05245;
+}
+
+.time-range-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.setting-row.compact {
+  grid-template-columns: auto 1fr;
+  min-height: 38px;
+}
+
+.setting-row input[type='time'] {
+  width: 100%;
+  height: 38px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: #ffffff;
+}
+
+.compact-path {
+  margin-top: -2px;
+  font-size: 11px;
+}
+
 .toast {
   position: fixed;
   right: 26px;
@@ -953,6 +1013,7 @@ p {
   bottom: 30px;
   left: 34px;
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
   gap: 18px;
@@ -1010,6 +1071,67 @@ p {
 
 .complete-button:disabled {
   opacity: 0.52;
+}
+
+.video-toggle-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 44px;
+  padding: 0 15px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  color: #ffffff;
+  background: rgba(6, 12, 10, 0.6);
+  backdrop-filter: blur(22px) saturate(1.1);
+  -webkit-backdrop-filter: blur(22px) saturate(1.1);
+  pointer-events: auto;
+}
+
+.video-toggle-button:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.reset-media-controls,
+.reminder-media-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.volume-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  color: #ffffff;
+  background: rgba(6, 12, 10, 0.6);
+  font-size: 13px;
+  backdrop-filter: blur(22px) saturate(1.1);
+  -webkit-backdrop-filter: blur(22px) saturate(1.1);
+  pointer-events: auto;
+}
+
+.volume-controls button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 6px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.volume-controls button:hover {
+  background: rgba(255, 255, 255, 0.18);
 }
 
 .play-overlay {
@@ -1097,6 +1219,113 @@ p {
 
 .fallback-reset span {
   color: rgba(255, 255, 255, 0.74);
+}
+
+.reminder-shell {
+  position: relative;
+  min-height: 100dvh;
+  overflow: hidden;
+  color: #ffffff;
+  background: #050807;
+}
+
+.reminder-video {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #050807;
+}
+
+.reminder-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 24px;
+  padding: 48px 54px;
+  background: linear-gradient(180deg, transparent 42%, rgba(5, 8, 7, 0.88) 100%);
+  pointer-events: none;
+}
+
+.reminder-copy {
+  max-width: 680px;
+}
+
+.reminder-kicker {
+  color: #a7dccd;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.reminder-copy h1 {
+  margin-top: 10px;
+  color: #ffffff;
+  font-size: clamp(30px, 4vw, 58px);
+  line-height: 1.12;
+}
+
+.reminder-copy p {
+  max-width: 580px;
+  margin-top: 14px;
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 16px;
+  line-height: 1.65;
+}
+
+.reminder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  pointer-events: auto;
+}
+
+.reminder-play-button,
+.reminder-close-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 0 17px;
+  border-radius: 8px;
+  font-weight: 720;
+}
+
+.reminder-play-button {
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  color: #ffffff;
+  background: rgba(6, 12, 10, 0.62);
+}
+
+.reminder-close-button {
+  color: #102019;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.reminder-play-button:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.reminder-close-button:hover {
+  background: #ffffff;
+}
+
+.reminder-emergency-note {
+  display: inline-flex;
+  align-items: center;
+  min-height: 48px;
+  padding: 0 15px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.76);
+  background: rgba(6, 12, 10, 0.58);
+  font-size: 13px;
+  backdrop-filter: blur(22px) saturate(1.1);
+  -webkit-backdrop-filter: blur(22px) saturate(1.1);
 }
 
 @keyframes breathe {

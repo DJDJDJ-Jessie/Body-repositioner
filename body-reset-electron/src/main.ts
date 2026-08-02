@@ -6,11 +6,20 @@ if (!window.bodyReset) {
   const mockSettings = {
     focusMinutes: 50,
     resetMinutes: 6,
+    resetVolume: 1,
+    sleepReminderVolume: 1,
     videoFolder: 'videos',
+    sleepReminderEnabled: false,
+    sleepReminderStart: '23:00',
+    sleepReminderEnd: '07:00',
+    sleepReminderInterval: 30,
+    sleepReminderFolder: 'sleep-reminders',
     strictMode: true,
     minimizeToTray: true,
     autoStart: false,
     emergencyExitSeconds: 5,
+    externalLogSyncEnabled: false,
+    externalLogSyncFolder: '',
   }
   const mockState = {
     appRoot: 'preview',
@@ -23,6 +32,8 @@ if (!window.bodyReset) {
     matchedVideoFolderName: null,
     videos: [],
     videoCount: 0,
+    sleepReminderVideoFolderPath: 'preview/sleep-reminders',
+    sleepReminderVideoCount: 0,
     todayStats: {
       date: new Date().toISOString().slice(0, 10),
       focusMs: 0,
@@ -30,6 +41,13 @@ if (!window.bodyReset) {
       resetCount: 0,
       completedResetCount: 0,
       skippedResetCount: 0,
+    },
+    externalLogSyncStatus: {
+      enabled: false,
+      folderPath: '',
+      configured: false,
+      lastSyncedAt: null,
+      lastError: null,
     },
     shouldAutoStartTimer: false,
   }
@@ -77,6 +95,20 @@ if (!window.bodyReset) {
       count: 0,
       videos: [],
     }),
+    scanSleepReminderVideos: async () => ({
+      folderPath: mockState.sleepReminderVideoFolderPath,
+      count: 0,
+      videos: [],
+    }),
+    openSleepReminderFolder: async () => ({
+      folderPath: mockState.sleepReminderVideoFolderPath,
+      count: 0,
+      videos: [],
+    }),
+    openDataFolder: async () => mockState.externalLogSyncStatus,
+    chooseExternalLogFolder: async () => mockState,
+    openExternalLogFolder: async () => mockState.externalLogSyncStatus,
+    syncExternalLogs: async () => mockState.externalLogSyncStatus,
     addFocusTime: async (ms) => {
       mockState.todayStats.focusMs += Math.max(0, Math.round(ms))
       return mockState.todayStats
@@ -96,8 +128,12 @@ if (!window.bodyReset) {
     }),
     completeReset: async () => ({ completed: true }),
     emergencyCloseReset: async () => ({ completed: false }),
+    getReminderPayload: async () => null,
+    emergencyCloseReminder: async () => ({ closed: true, nextReminderAt: Date.now() + 300_000 }),
     setAutoStart: async () => mockSettings,
     onResetCompleted: () => () => undefined,
+    onSystemSuspend: () => () => undefined,
+    onSystemResume: () => () => undefined,
   }
 }
 
