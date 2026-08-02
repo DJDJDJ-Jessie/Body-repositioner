@@ -65,6 +65,9 @@ const defaultSettings = {
   sleepReminderInterval: 30,
   sleepReminderFolder: 'sleep-reminders',
   strictMode: true,
+  autoStartWhenUnlocked: true,
+  earlyResetEnabled: false,
+  earlyResetMinutes: 3,
   minimizeToTray: true,
   autoStart: false,
   emergencyExitSeconds: 5,
@@ -212,6 +215,14 @@ function normalizeSettings(input) {
         ? merged.sleepReminderFolder.trim()
         : defaultSettings.sleepReminderFolder,
     strictMode: Boolean(merged.strictMode),
+    autoStartWhenUnlocked: Boolean(merged.autoStartWhenUnlocked),
+    earlyResetEnabled: Boolean(merged.earlyResetEnabled),
+    earlyResetMinutes: clampInt(
+      merged.earlyResetMinutes,
+      1,
+      60,
+      defaultSettings.earlyResetMinutes,
+    ),
     minimizeToTray: Boolean(merged.minimizeToTray),
     autoStart: Boolean(merged.autoStart),
     emergencyExitSeconds: clampInt(
@@ -857,6 +868,14 @@ function shouldAutoStartTimer() {
   }
 }
 
+function isSystemLocked() {
+  try {
+    return powerMonitor.getSystemIdleState(0) === 'locked';
+  } catch {
+    return false;
+  }
+}
+
 function timeToMinutes(value) {
   const [hours, minutes] = String(value || '').split(':').map(Number);
   if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
@@ -946,6 +965,7 @@ function buildAppState() {
     sleepReminderVideoCount: reminderLibrary.count,
     todayStats: getTodayStats(),
     externalLogSyncStatus: getExternalLogSyncStatus(settings),
+    systemLocked: isSystemLocked(),
     shouldAutoStartTimer: shouldAutoStartTimer(),
   };
 }
@@ -1288,6 +1308,18 @@ ipcMain.handle('reset:get-payload', () => {
 });
 
 ipcMain.handle('reset:complete', (_event, payload = {}) => {
+  const resetPayload = pendingResetPayload;
+  const hasVideo = Boolean(resetPayload && resetPayload.video);
+  const videoEnded = Boolean(payload.videoEnded);
+  const elapsedMs = resetPayload?.startedAt ? Date.now() - resetPayload.startedAt : 0;
+  const earlyResetAllowed =
+    Boolean(resetPayload?.settings.earlyResetEnabled) &&
+    elapsedMs >= resetPayload.settings.earlyResetMinutes * 60_000;
+
+  if (hasVideo && !videoEnded && !earlyResetAllowed) {
+    return { completed: false, reason: 'not-ready' };
+  }
+
   if (pendingResetPayload) {
     pendingResetPayload.canClose = true;
   }
@@ -1355,6 +1387,18 @@ app.whenReady().then(() => {
   powerMonitor.on('resume', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('system:resume');
+    }
+  });
+
+  powerMonitor.on('lock-screen', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:lock');
+    }
+  });
+
+  powerMonitor.on('unlock-screen', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:unlock');
     }
   });
 

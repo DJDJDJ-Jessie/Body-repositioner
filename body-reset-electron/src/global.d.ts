@@ -18,7 +18,10 @@ declare global {
       getStatsTable: (period: StatsPeriod) => Promise<StatsTable>
       beginReset: () => Promise<ResetPayload>
       getResetPayload: () => Promise<ResetPayload>
-      completeReset: (payload: { videoName?: string }) => Promise<{ completed: boolean }>
+      completeReset: (payload: { videoName?: string; videoEnded?: boolean }) => Promise<{
+        completed: boolean
+        reason?: 'not-ready'
+      }>
       emergencyCloseReset: () => Promise<{ completed: boolean }>
       getReminderPayload: () => Promise<ReminderPayload | null>
       emergencyCloseReminder: () => Promise<{ closed: boolean; nextReminderAt: number }>
@@ -28,6 +31,8 @@ declare global {
       ) => () => void
       onSystemSuspend: (callback: () => void) => () => void
       onSystemResume: (callback: () => void) => () => void
+      onSystemLock: (callback: () => void) => () => void
+      onSystemUnlock: (callback: () => void) => () => void
     }
   }
 
@@ -43,6 +48,9 @@ declare global {
     sleepReminderInterval: number
     sleepReminderFolder: string
     strictMode: boolean
+    autoStartWhenUnlocked: boolean
+    earlyResetEnabled: boolean
+    earlyResetMinutes: number
     minimizeToTray: boolean
     autoStart: boolean
     emergencyExitSeconds: number
@@ -131,11 +139,13 @@ declare global {
     sleepReminderVideoCount: number
     todayStats: TodayStats
     externalLogSyncStatus: ExternalLogSyncStatus
+    systemLocked: boolean
     shouldAutoStartTimer: boolean
   }
 
   type ResetPayload = {
     id: number
+    startedAt?: number
     video: VideoItem | null
     settings: AppSettings
     canClose: boolean

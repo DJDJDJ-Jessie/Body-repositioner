@@ -36,4 +36,14 @@ contextBridge.exposeInMainWorld('bodyReset', {
     ipcRenderer.on('system:resume', listener);
     return () => ipcRenderer.removeListener('system:resume', listener);
   },
+  onSystemLock: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('system:lock', listener);
+    return () => ipcRenderer.removeListener('system:lock', listener);
+  },
+  onSystemUnlock: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('system:unlock', listener);
+    return () => ipcRenderer.removeListener('system:unlock', listener);
+  },
 });

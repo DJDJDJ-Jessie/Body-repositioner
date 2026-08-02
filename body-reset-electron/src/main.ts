@@ -15,6 +15,9 @@ if (!window.bodyReset) {
     sleepReminderInterval: 30,
     sleepReminderFolder: 'sleep-reminders',
     strictMode: true,
+    autoStartWhenUnlocked: true,
+    earlyResetEnabled: false,
+    earlyResetMinutes: 3,
     minimizeToTray: true,
     autoStart: false,
     emergencyExitSeconds: 5,
@@ -49,6 +52,7 @@ if (!window.bodyReset) {
       lastSyncedAt: null,
       lastError: null,
     },
+    systemLocked: false,
     shouldAutoStartTimer: false,
   }
   const getMockStatsTable = (period: 'week' | 'month') => ({
@@ -134,6 +138,8 @@ if (!window.bodyReset) {
     onResetCompleted: () => () => undefined,
     onSystemSuspend: () => () => undefined,
     onSystemResume: () => () => undefined,
+    onSystemLock: () => () => undefined,
+    onSystemUnlock: () => () => undefined,
   }
 }
 
