@@ -5,10 +5,12 @@ const {
   ipcMain,
   Menu,
   nativeImage,
+  powerMonitor,
   screen,
   shell,
   Tray,
 } = require('electron');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -54,20 +56,45 @@ const appIconDataUrl =
 const defaultSettings = {
   focusMinutes: 50,
   resetMinutes: 6,
+  resetVolume: 1,
+  sleepReminderVolume: 1,
   videoFolder: 'videos',
+  sleepReminderEnabled: false,
+  sleepReminderStart: '23:00',
+  sleepReminderEnd: '07:00',
+  sleepReminderInterval: 30,
+  sleepReminderFolder: 'sleep-reminders',
   strictMode: true,
   minimizeToTray: true,
   autoStart: false,
   emergencyExitSeconds: 5,
+  externalLogSyncEnabled: false,
+  externalLogSyncFolder: '',
 };
 
 let mainWindow = null;
 let resetWindow = null;
+let reminderWindow = null;
 let tray = null;
 let isQuitting = false;
 let pendingResetPayload = null;
+let pendingReminderPayload = null;
 let settingsCache = null;
 let appIcon = null;
+let reminderTimer = null;
+let nextReminderAt = 0;
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
 
 function getAppIcon(size = 32) {
   if (!appIcon) {
@@ -109,6 +136,10 @@ function getVideoStatePath() {
   return path.join(getDataDir(), 'video-state.json');
 }
 
+function getReminderVideoStatePath() {
+  return path.join(getDataDir(), 'reminder-video-state.json');
+}
+
 function getLogPath() {
   return path.join(getDataDir(), 'reset-log.csv');
 }
@@ -121,6 +152,10 @@ function getStatsCsvPath() {
   return path.join(getDataDir(), 'daily-stats.csv');
 }
 
+function getExternalLogSyncStatePath() {
+  return path.join(getDataDir(), 'external-log-sync.json');
+}
+
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -130,6 +165,7 @@ function ensureDir(dir) {
 function ensurePortableDirs() {
   ensureDir(getDataDir());
   ensureDir(getVideoFolderPath(loadSettings()));
+  ensureDir(getSleepReminderFolderPath(loadSettings()));
 }
 
 function readJson(filePath, fallback) {
@@ -151,10 +187,30 @@ function normalizeSettings(input) {
   return {
     focusMinutes: clampInt(merged.focusMinutes, 1, 240, defaultSettings.focusMinutes),
     resetMinutes: clampInt(merged.resetMinutes, 1, 60, defaultSettings.resetMinutes),
+    resetVolume: clampFloat(merged.resetVolume, 0, 1, defaultSettings.resetVolume),
+    sleepReminderVolume: clampFloat(
+      merged.sleepReminderVolume,
+      0,
+      1,
+      defaultSettings.sleepReminderVolume,
+    ),
     videoFolder:
       typeof merged.videoFolder === 'string' && merged.videoFolder.trim()
         ? merged.videoFolder.trim()
         : defaultSettings.videoFolder,
+    sleepReminderEnabled: Boolean(merged.sleepReminderEnabled),
+    sleepReminderStart: normalizeTimeValue(merged.sleepReminderStart, defaultSettings.sleepReminderStart),
+    sleepReminderEnd: normalizeTimeValue(merged.sleepReminderEnd, defaultSettings.sleepReminderEnd),
+    sleepReminderInterval: clampInt(
+      merged.sleepReminderInterval,
+      5,
+      240,
+      defaultSettings.sleepReminderInterval,
+    ),
+    sleepReminderFolder:
+      typeof merged.sleepReminderFolder === 'string' && merged.sleepReminderFolder.trim()
+        ? merged.sleepReminderFolder.trim()
+        : defaultSettings.sleepReminderFolder,
     strictMode: Boolean(merged.strictMode),
     minimizeToTray: Boolean(merged.minimizeToTray),
     autoStart: Boolean(merged.autoStart),
@@ -164,13 +220,33 @@ function normalizeSettings(input) {
       20,
       defaultSettings.emergencyExitSeconds,
     ),
+    externalLogSyncEnabled: Boolean(merged.externalLogSyncEnabled),
+    externalLogSyncFolder:
+      typeof merged.externalLogSyncFolder === 'string' && merged.externalLogSyncFolder.trim()
+        ? merged.externalLogSyncFolder.trim()
+        : defaultSettings.externalLogSyncFolder,
   };
+}
+
+function normalizeTimeValue(value, fallback) {
+  const match = String(value || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return fallback;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return fallback;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
 }
 
 function clampInt(value, min, max, fallback) {
   const next = Number.parseInt(value, 10);
   if (!Number.isFinite(next)) return fallback;
   return Math.min(max, Math.max(min, next));
+}
+
+function clampFloat(value, min, max, fallback) {
+  const next = Number(value);
+  if (!Number.isFinite(next)) return fallback;
+  return Math.round(Math.min(max, Math.max(min, next)) * 10) / 10;
 }
 
 function loadSettings() {
@@ -181,10 +257,27 @@ function loadSettings() {
 }
 
 function saveSettings(nextSettings) {
+  const previousSettings = settingsCache;
   settingsCache = normalizeSettings(nextSettings);
   writeJson(getSettingsPath(), settingsCache);
   ensureDir(getVideoFolderPath(settingsCache));
+  ensureDir(getSleepReminderFolderPath(settingsCache));
+  if (
+    settingsCache.sleepReminderEnabled &&
+    (!previousSettings || !previousSettings.sleepReminderEnabled)
+  ) {
+    nextReminderAt = Date.now() + settingsCache.sleepReminderInterval * 60_000;
+  }
   applyAutoStart(settingsCache.autoStart);
+  if (settingsCache.externalLogSyncEnabled) {
+    syncExternalLogs(settingsCache);
+  } else {
+    const syncState = readJson(getExternalLogSyncStatePath(), {});
+    writeJson(getExternalLogSyncStatePath(), {
+      lastSyncedAt: typeof syncState.lastSyncedAt === 'string' ? syncState.lastSyncedAt : null,
+      lastError: null,
+    });
+  }
   return settingsCache;
 }
 
@@ -194,6 +287,14 @@ function getVideoFolderPath(settings = loadSettings()) {
   }
 
   return path.join(getPortableRoot(), settings.videoFolder);
+}
+
+function getSleepReminderFolderPath(settings = loadSettings()) {
+  if (path.isAbsolute(settings.sleepReminderFolder)) {
+    return settings.sleepReminderFolder;
+  }
+
+  return path.join(getPortableRoot(), settings.sleepReminderFolder);
 }
 
 function normalizeFolderName(name) {
@@ -308,6 +409,23 @@ function scanVideos() {
   };
 }
 
+function scanSleepReminderVideos() {
+  const folderPath = getSleepReminderFolderPath();
+  ensureDir(folderPath);
+  const videos = fs
+    .readdirSync(folderPath, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && videoExtensions.has(path.extname(entry.name).toLowerCase()))
+    .map((entry) => toPublicVideo(path.join(folderPath, entry.name)))
+    .filter((video) => video.size > 0)
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+
+  return {
+    folderPath,
+    count: videos.length,
+    videos,
+  };
+}
+
 function readVideoState() {
   return readJson(getVideoStatePath(), { playedPaths: [], lastPath: null });
 }
@@ -345,6 +463,34 @@ function pickNextVideo() {
   return next;
 }
 
+function pickNextSleepReminderVideo() {
+  const library = scanSleepReminderVideos();
+  if (!library.videos.length) return null;
+
+  const currentPaths = new Set(library.videos.map((video) => video.path));
+  const state = readJson(getReminderVideoStatePath(), { playedPaths: [], lastPath: null });
+  const playedPaths = Array.isArray(state.playedPaths)
+    ? state.playedPaths.filter((item) => currentPaths.has(item))
+    : [];
+  let candidates = library.videos.filter((video) => !playedPaths.includes(video.path));
+
+  if (!candidates.length) {
+    candidates = library.videos.slice();
+    playedPaths.length = 0;
+  }
+
+  if (candidates.length > 1 && state.lastPath) {
+    candidates = candidates.filter((video) => video.path !== state.lastPath);
+  }
+
+  const next = candidates[Math.floor(Math.random() * candidates.length)];
+  writeJson(getReminderVideoStatePath(), {
+    playedPaths: [...playedPaths, next.path],
+    lastPath: next.path,
+  });
+  return next;
+}
+
 function appendResetLog(payload) {
   const filePath = getLogPath();
   const exists = fs.existsSync(filePath);
@@ -355,10 +501,131 @@ function appendResetLog(payload) {
   ].join(',');
 
   fs.appendFileSync(filePath, `${exists ? '' : 'time,result,video\n'}${row}\n`, 'utf8');
+  syncExternalLogs();
 }
 
 function csv(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+function getExternalLogSyncFolder(settings = loadSettings()) {
+  const rawFolder = settings && typeof settings.externalLogSyncFolder === 'string'
+    ? settings.externalLogSyncFolder.trim()
+    : '';
+  if (!rawFolder) return '';
+  return path.resolve(path.isAbsolute(rawFolder) ? rawFolder : path.join(getPortableRoot(), rawFolder));
+}
+
+function getSystemTimeZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'system-local';
+  } catch {
+    return 'system-local';
+  }
+}
+
+function normalizeComparablePath(value) {
+  return path.resolve(value).replace(/[\\/]+$/, '').toLowerCase();
+}
+
+function getExternalLogSyncStatus(settings = loadSettings()) {
+  const state = readJson(getExternalLogSyncStatePath(), {});
+  const folderPath = getExternalLogSyncFolder(settings);
+  let lastError = typeof state.lastError === 'string' && state.lastError ? state.lastError : null;
+
+  if (settings.externalLogSyncEnabled && !folderPath) {
+    lastError = '请先选择外部日志文件夹';
+  }
+
+  return {
+    enabled: Boolean(settings.externalLogSyncEnabled),
+    folderPath,
+    configured: Boolean(folderPath),
+    lastSyncedAt: typeof state.lastSyncedAt === 'string' ? state.lastSyncedAt : null,
+    lastError,
+  };
+}
+
+function saveExternalLogSyncState(nextState = {}) {
+  const current = readJson(getExternalLogSyncStatePath(), {});
+  writeJson(getExternalLogSyncStatePath(), {
+    lastSyncedAt:
+      typeof nextState.lastSyncedAt === 'string'
+        ? nextState.lastSyncedAt
+        : typeof current.lastSyncedAt === 'string'
+          ? current.lastSyncedAt
+          : null,
+    lastError: typeof nextState.lastError === 'string' && nextState.lastError ? nextState.lastError : null,
+  });
+}
+
+function syncExternalLogs(settings = loadSettings()) {
+  if (!settings.externalLogSyncEnabled) {
+    return getExternalLogSyncStatus(settings);
+  }
+
+  const folderPath = getExternalLogSyncFolder(settings);
+  if (!folderPath) {
+    saveExternalLogSyncState({ lastError: '请先选择外部日志文件夹' });
+    return getExternalLogSyncStatus(settings);
+  }
+
+  if (normalizeComparablePath(folderPath) === normalizeComparablePath(getDataDir())) {
+    saveExternalLogSyncState({ lastError: '外部日志文件夹不能与程序内部 data 文件夹相同' });
+    return getExternalLogSyncStatus(settings);
+  }
+
+  try {
+    ensureDir(folderPath);
+    if (!fs.existsSync(getStatsCsvPath())) {
+      writeStatsCsv(readStatsStore());
+    }
+
+    const files = [
+      {
+        name: 'reset-log.csv',
+        sourcePath: getLogPath(),
+        description: '每次复位的原始记录；time 使用 ISO 8601 UTC 时间。',
+      },
+      {
+        name: 'daily-stats.csv',
+        sourcePath: getStatsCsvPath(),
+        description: '按系统本地日期生成的每日工作与复位汇总。',
+      },
+    ];
+
+    const copiedFiles = [];
+    for (const file of files) {
+      if (!fs.existsSync(file.sourcePath)) continue;
+      fs.copyFileSync(file.sourcePath, path.join(folderPath, file.name));
+      copiedFiles.push({ name: file.name, description: file.description });
+    }
+
+    const syncedAt = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(folderPath, 'review-sync-manifest.json'),
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          app: 'body-reset-reminder',
+          displayName: '身体复位提醒器',
+          syncedAt,
+          timezone: getSystemTimeZone(),
+          files: copiedFiles,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    saveExternalLogSyncState({ lastSyncedAt: syncedAt, lastError: null });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    saveExternalLogSyncState({ lastError: message });
+    console.error('External log sync failed:', message);
+  }
+
+  return getExternalLogSyncStatus(settings);
 }
 
 function getLocalDateKey(date = new Date()) {
@@ -546,6 +813,7 @@ function updateTodayStats(mutator) {
   mutator(day);
   store.days[dateKey] = normalizeDayStats(day, dateKey);
   writeStatsStore(store);
+  syncExternalLogs();
   return store.days[dateKey];
 }
 
@@ -589,9 +857,80 @@ function shouldAutoStartTimer() {
   }
 }
 
+function timeToMinutes(value) {
+  const [hours, minutes] = String(value || '').split(':').map(Number);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
+  return hours * 60 + minutes;
+}
+
+function isWithinSleepReminderWindow(date = new Date()) {
+  const settings = loadSettings();
+  const start = timeToMinutes(settings.sleepReminderStart);
+  const end = timeToMinutes(settings.sleepReminderEnd);
+  if (start === null || end === null || start === end) return false;
+
+  const current = date.getHours() * 60 + date.getMinutes();
+  return start < end ? current >= start && current < end : current >= start || current < end;
+}
+
+function checkSleepReminderSchedule() {
+  const settings = loadSettings();
+  if (!settings.sleepReminderEnabled || !isWithinSleepReminderWindow()) return;
+  if (resetWindow && !resetWindow.isDestroyed()) return;
+  if (reminderWindow && !reminderWindow.isDestroyed()) return;
+
+  const intervalMs = settings.sleepReminderInterval * 60_000;
+  if (Date.now() < nextReminderAt) return;
+
+  const video = pickNextSleepReminderVideo();
+  if (!video) return;
+
+  nextReminderAt = Date.now() + intervalMs;
+  pendingReminderPayload = {
+    id: Date.now(),
+    startedAt: Date.now(),
+    video,
+    settings,
+    canClose: false,
+  };
+  createReminderWindow();
+}
+
+function startSleepReminderSchedule() {
+  if (reminderTimer) clearInterval(reminderTimer);
+  const settings = loadSettings();
+  nextReminderAt = Date.now() + settings.sleepReminderInterval * 60_000;
+  reminderTimer = setInterval(checkSleepReminderSchedule, 15_000);
+}
+
+function pauseActiveMedia() {
+  if (process.platform !== 'win32') return;
+
+  const script = `
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class BodyResetMediaKeys {
+  [DllImport("user32.dll")]
+  public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+'@
+[BodyResetMediaKeys]::keybd_event(0xB3, 0, 0, [UIntPtr]::Zero)
+[BodyResetMediaKeys]::keybd_event(0xB3, 0, 2, [UIntPtr]::Zero)
+`;
+
+  const child = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script],
+    { windowsHide: true, stdio: 'ignore' },
+  );
+  child.unref();
+}
+
 function buildAppState() {
   const settings = loadSettings();
   const library = scanVideos();
+  const reminderLibrary = scanSleepReminderVideos();
   return {
     appRoot: getPortableRoot(),
     dataDir: getDataDir(),
@@ -603,7 +942,10 @@ function buildAppState() {
     matchedVideoFolderName: library.matchedFolderName,
     videos: library.videos,
     videoCount: library.count,
+    sleepReminderVideoFolderPath: reminderLibrary.folderPath,
+    sleepReminderVideoCount: reminderLibrary.count,
     todayStats: getTodayStats(),
+    externalLogSyncStatus: getExternalLogSyncStatus(settings),
     shouldAutoStartTimer: shouldAutoStartTimer(),
   };
 }
@@ -703,6 +1045,61 @@ function createResetWindow() {
   });
 }
 
+function createReminderWindow() {
+  if (reminderWindow && !reminderWindow.isDestroyed()) {
+    reminderWindow.focus();
+    return;
+  }
+
+  const display =
+    mainWindow && !mainWindow.isDestroyed()
+      ? screen.getDisplayMatching(mainWindow.getBounds())
+      : screen.getPrimaryDisplay();
+  const bounds = display.bounds;
+
+  reminderWindow = new BrowserWindow({
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    fullscreen: true,
+    frame: false,
+    alwaysOnTop: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    skipTaskbar: true,
+    title: '睡眠提醒',
+    backgroundColor: '#050807',
+    icon: getAppIcon(64),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      webSecurity: false,
+    },
+  });
+
+  reminderWindow.setBounds(bounds);
+  reminderWindow.setFullScreen(true);
+  reminderWindow.setAlwaysOnTop(true, 'screen-saver');
+  reminderWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  loadRenderer(reminderWindow, 'reminder');
+
+  reminderWindow.on('close', (event) => {
+    if (pendingReminderPayload && !pendingReminderPayload.canClose && !isQuitting) {
+      event.preventDefault();
+    }
+  });
+
+  reminderWindow.on('closed', () => {
+    reminderWindow = null;
+    pendingReminderPayload = null;
+  });
+}
+
 function loadRenderer(win, view = 'main') {
   if (!app.isPackaged) {
     win.loadURL(`http://127.0.0.1:5173?view=${view}`);
@@ -767,7 +1164,7 @@ ipcMain.handle('stats:get-table', (_event, period) => buildStatsTable(period));
 
 ipcMain.handle('settings:save', (_event, nextSettings) => {
   return {
-    settings: saveSettings(nextSettings),
+    settings: saveSettings({ ...loadSettings(), ...(nextSettings || {}) }),
     state: buildAppState(),
   };
 });
@@ -779,11 +1176,57 @@ ipcMain.handle('app:set-auto-start', (_event, enabled) => {
 
 ipcMain.handle('videos:scan', () => scanVideos());
 
+ipcMain.handle('sleep-reminders:scan', () => scanSleepReminderVideos());
+
 ipcMain.handle('videos:open-folder', async () => {
   const folderPath = getVideoFolderPath();
   ensureDir(folderPath);
   await shell.openPath(folderPath);
   return scanVideos();
+});
+
+ipcMain.handle('sleep-reminders:open-folder', async () => {
+  const folderPath = getSleepReminderFolderPath();
+  ensureDir(folderPath);
+  await shell.openPath(folderPath);
+  return scanSleepReminderVideos();
+});
+
+ipcMain.handle('logs:open-data-folder', async () => {
+  const folderPath = getDataDir();
+  ensureDir(folderPath);
+  await shell.openPath(folderPath);
+  return getExternalLogSyncStatus();
+});
+
+ipcMain.handle('logs:choose-external-folder', async () => {
+  const currentFolder = getExternalLogSyncFolder();
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择外部日志同步文件夹',
+    defaultPath: currentFolder || getPortableRoot(),
+    properties: ['openDirectory', 'createDirectory'],
+  });
+
+  if (result.canceled || !result.filePaths[0]) {
+    return buildAppState();
+  }
+
+  saveSettings({ ...loadSettings(), externalLogSyncFolder: result.filePaths[0] });
+  return buildAppState();
+});
+
+ipcMain.handle('logs:open-external-folder', async () => {
+  const settings = loadSettings();
+  const folderPath = getExternalLogSyncFolder(settings);
+  if (!folderPath) return getExternalLogSyncStatus(settings);
+  ensureDir(folderPath);
+  await shell.openPath(folderPath);
+  return getExternalLogSyncStatus(settings);
+});
+
+ipcMain.handle('logs:sync-external', () => {
+  const settings = loadSettings();
+  return syncExternalLogs(settings);
 });
 
 ipcMain.handle('videos:choose-folder', async () => {
@@ -802,6 +1245,7 @@ ipcMain.handle('videos:choose-folder', async () => {
 });
 
 ipcMain.handle('reset:begin', () => {
+  pauseActiveMedia();
   const video = pickNextVideo();
   pendingResetPayload = {
     id: Date.now(),
@@ -812,6 +1256,22 @@ ipcMain.handle('reset:begin', () => {
   };
   createResetWindow();
   return pendingResetPayload;
+});
+
+ipcMain.handle('reminder:get-payload', () => pendingReminderPayload);
+
+ipcMain.handle('reminder:emergency-close', () => {
+  if (pendingReminderPayload) {
+    pendingReminderPayload.canClose = true;
+  }
+
+  nextReminderAt = Date.now() + 5 * 60_000;
+  if (reminderWindow && !reminderWindow.isDestroyed()) {
+    reminderWindow.close();
+  } else {
+    pendingReminderPayload = null;
+  }
+  return { closed: true, nextReminderAt };
 });
 
 ipcMain.handle('reset:get-payload', () => {
@@ -874,10 +1334,29 @@ ipcMain.handle('reset:emergency-close', () => {
   return { completed: false };
 });
 
+if (gotSingleInstanceLock) {
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
+  const startupSettings = loadSettings();
   ensurePortableDirs();
+  applyAutoStart(startupSettings.autoStart);
+  if (startupSettings.externalLogSyncEnabled) {
+    syncExternalLogs();
+  }
   createMainWindow();
+  startSleepReminderSchedule();
+
+  powerMonitor.on('suspend', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:suspend');
+    }
+  });
+
+  powerMonitor.on('resume', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:resume');
+    }
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -885,6 +1364,7 @@ app.whenReady().then(() => {
     }
   });
 });
+}
 
 app.on('before-quit', () => {
   isQuitting = true;

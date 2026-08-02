@@ -19,11 +19,20 @@ import {
 type AppSettings = {
   focusMinutes: number
   resetMinutes: number
+  resetVolume: number
+  sleepReminderVolume: number
   videoFolder: string
+  sleepReminderEnabled: boolean
+  sleepReminderStart: string
+  sleepReminderEnd: string
+  sleepReminderInterval: number
+  sleepReminderFolder: string
   strictMode: boolean
   minimizeToTray: boolean
   autoStart: boolean
   emergencyExitSeconds: number
+  externalLogSyncEnabled: boolean
+  externalLogSyncFolder: string
 }
 
 type TodayStats = {
@@ -60,6 +69,14 @@ type StatsTable = {
   totals: StatsTotals
 }
 
+type ExternalLogSyncStatus = {
+  enabled: boolean
+  folderPath: string
+  configured: boolean
+  lastSyncedAt: string | null
+  lastError: string | null
+}
+
 type VideoItem = {
   name: string
   path: string
@@ -79,7 +96,10 @@ type AppState = {
   matchedVideoFolderName: string | null
   videos: VideoItem[]
   videoCount: number
+  sleepReminderVideoFolderPath: string
+  sleepReminderVideoCount: number
   todayStats: TodayStats
+  externalLogSyncStatus: ExternalLogSyncStatus
   shouldAutoStartTimer: boolean
 }
 
@@ -91,14 +111,31 @@ type ResetPayload = {
   canClose: boolean
 }
 
+type ReminderPayload = {
+  id: number
+  startedAt: number
+  video: VideoItem | null
+  settings: AppSettings
+  canClose: boolean
+}
+
 const fallbackSettings: AppSettings = {
   focusMinutes: 50,
   resetMinutes: 6,
+  resetVolume: 1,
+  sleepReminderVolume: 1,
   videoFolder: 'videos',
+  sleepReminderEnabled: false,
+  sleepReminderStart: '23:00',
+  sleepReminderEnd: '07:00',
+  sleepReminderInterval: 30,
+  sleepReminderFolder: 'sleep-reminders',
   strictMode: true,
   minimizeToTray: true,
   autoStart: false,
   emergencyExitSeconds: 5,
+  externalLogSyncEnabled: false,
+  externalLogSyncFolder: '',
 }
 const fallbackTodayStats: TodayStats = {
   date: '',
@@ -116,6 +153,13 @@ const fallbackStatsTotals: StatsTotals = {
   skippedResetCount: 0,
   completionRate: 0,
 }
+const fallbackExternalLogSyncStatus: ExternalLogSyncStatus = {
+  enabled: false,
+  folderPath: '',
+  configured: false,
+  lastSyncedAt: null,
+  lastError: null,
+}
 
 function createEmptyStatsTable(period: StatsPeriod = 'week'): StatsTable {
   const today = getBrowserDateKey()
@@ -132,6 +176,7 @@ function createEmptyStatsTable(period: StatsPeriod = 'week'): StatsTable {
 
 const view = new URLSearchParams(window.location.search).get('view') || 'main'
 const isResetView = view === 'reset'
+const isReminderView = view === 'reminder'
 
 const settings = ref<AppSettings>({ ...fallbackSettings })
 const remainingMs = ref(fallbackSettings.focusMinutes * 60_000)
@@ -140,7 +185,10 @@ const videoCount = ref(0)
 const videoFolderPath = ref('')
 const baseVideoFolderPath = ref('')
 const videoSourceLabel = ref('')
+const sleepReminderVideoFolderPath = ref('')
+const sleepReminderVideoCount = ref(0)
 const todayStats = ref<TodayStats>({ ...fallbackTodayStats })
+const externalLogSyncStatus = ref<ExternalLogSyncStatus>({ ...fallbackExternalLogSyncStatus })
 const statsPeriod = ref<StatsPeriod>('week')
 const statsTable = ref<StatsTable>(createEmptyStatsTable('week'))
 const isSettingsOpen = ref(false)
@@ -157,17 +205,34 @@ const fallbackRemaining = ref(30)
 const emergencyHolding = ref(false)
 const emergencyLeft = ref(0)
 const resetVolume = ref(1)
+const resetIsPlaying = ref(false)
 const resetNotice = ref('身体先回来，工作等一下。')
+const reminderPayload = ref<ReminderPayload | null>(null)
+const reminderVideoRef = ref<HTMLVideoElement | null>(null)
+const reminderVolume = ref(1)
+const reminderIsPlaying = ref(false)
+const reminderEmergencyHolding = ref(false)
+const reminderEmergencyLeft = ref(0)
 
 let tickHandle: number | null = null
 let lastTickAt = 0
 let toastHandle: number | null = null
 let fallbackHandle: number | null = null
 let emergencyHandle: number | null = null
+let reminderEmergencyHandle: number | null = null
 let removeResetListener: (() => void) | null = null
+let removeSuspendListener: (() => void) | null = null
+let removeResumeListener: (() => void) | null = null
+let mediaVolumeSaveHandle: number | null = null
+let pendingMediaVolumeSave: {
+  key: 'resetVolume' | 'sleepReminderVolume'
+  value: number
+} | null = null
+let settingsSaveChain = Promise.resolve()
 let focusBufferMs = 0
 let isFlushingFocus = false
 let autoStartChecked = false
+let wasRunningBeforeSuspend = false
 
 const totalFocusMs = computed(() => settings.value.focusMinutes * 60_000)
 const elapsedMs = computed(() => Math.max(0, totalFocusMs.value - remainingMs.value))
@@ -195,6 +260,8 @@ const primaryActionText = computed(() => {
 })
 const primaryActionIcon = computed(() => (timerMode.value === 'running' ? Pause : Play))
 const resetVideoName = computed(() => resetPayload.value?.video?.name || '')
+const resetVolumeText = computed(() => formatVolume(resetVolume.value))
+const reminderVolumeText = computed(() => formatVolume(reminderVolume.value))
 const resetButtonText = computed(() => {
   if (resetStage.value === 'ended') return '完成，回到工作'
   if (resetStage.value === 'empty') return '我已知道'
@@ -219,6 +286,21 @@ const statsCompletedText = computed(
   () => `${statsTable.value.totals.completedResetCount}/${statsTable.value.totals.resetCount} 次`,
 )
 const statsCompletionText = computed(() => `${statsTable.value.totals.completionRate}%`)
+const externalLogSyncStatusText = computed(() => {
+  if (!settings.value.externalLogSyncEnabled) {
+    return '未开启。程序仍会在自己的 data 文件夹保存完整日志。'
+  }
+  if (!settings.value.externalLogSyncFolder) {
+    return '已开启，但还没有选择外部同步文件夹。'
+  }
+  if (externalLogSyncStatus.value.lastError) {
+    return `同步异常：${externalLogSyncStatus.value.lastError}`
+  }
+  if (externalLogSyncStatus.value.lastSyncedAt) {
+    return `最近同步：${formatSyncTime(externalLogSyncStatus.value.lastSyncedAt)}`
+  }
+  return '已开启，下一次复位或统计变化后会自动同步。'
+})
 
 function formatTime(ms: number) {
   const safeMs = Math.max(0, ms)
@@ -226,6 +308,10 @@ function formatTime(ms: number) {
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function formatVolume(value: number) {
+  return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`
 }
 
 function formatDuration(ms: number) {
@@ -260,6 +346,11 @@ function formatShortDate(dateKey: string) {
   return `${parts[1]}/${parts[2]}`
 }
 
+function formatSyncTime(value: string) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
 function getCompletionText(stats: TodayStats | StatsTotals) {
   if (!stats.resetCount) return '0%'
   return `${Math.round((stats.completedResetCount / stats.resetCount) * 100)}%`
@@ -271,7 +362,13 @@ function applyState(nextState: AppState) {
   videoFolderPath.value = nextState.videoFolderPath
   baseVideoFolderPath.value = nextState.baseVideoFolderPath || nextState.videoFolderPath
   videoSourceLabel.value = nextState.videoSourceLabel || '今日使用：默认 videos 文件夹'
+  sleepReminderVideoFolderPath.value = nextState.sleepReminderVideoFolderPath || ''
+  sleepReminderVideoCount.value = nextState.sleepReminderVideoCount || 0
   todayStats.value = { ...fallbackTodayStats, ...nextState.todayStats }
+  externalLogSyncStatus.value = {
+    ...fallbackExternalLogSyncStatus,
+    ...nextState.externalLogSyncStatus,
+  }
   if (timerMode.value === 'idle') {
     remainingMs.value = settings.value.focusMinutes * 60_000
   }
@@ -392,16 +489,97 @@ async function beginReset() {
   await window.bodyReset.beginReset()
 }
 
+function handleSystemSuspend() {
+  if (isResetView || isReminderView) return
+  wasRunningBeforeSuspend = timerMode.value === 'running'
+  if (!wasRunningBeforeSuspend) return
+
+  timerMode.value = 'paused'
+  clearTicker()
+  void flushFocusStats()
+  showToast('电脑进入睡眠，倒计时已自动暂停')
+}
+
+function handleSystemResume() {
+  if (isResetView || isReminderView || !wasRunningBeforeSuspend) return
+  wasRunningBeforeSuspend = false
+  timerMode.value = 'running'
+  startTicker()
+  showToast('电脑已唤醒，倒计时已自动继续')
+}
+
 async function saveSettings() {
-  const result = await window.bodyReset.saveSettings(settings.value)
+  const snapshot = { ...settings.value }
+  const result = await queueSettingsSave(snapshot)
   applyState(result.state)
   showToast('设置已保存')
+}
+
+function queueSettingsSave(snapshot: AppSettings) {
+  const nextSave = settingsSaveChain.then(() =>
+    window.bodyReset.saveSettings({ ...snapshot }),
+  )
+  settingsSaveChain = nextSave.then(
+    () => undefined,
+    () => undefined,
+  )
+  return nextSave
 }
 
 async function chooseVideoFolder() {
   const nextState = await window.bodyReset.chooseVideoFolder()
   applyState(nextState)
   showToast('视频文件夹已更新')
+}
+
+async function chooseExternalLogFolder() {
+  const nextState = await window.bodyReset.chooseExternalLogFolder()
+  applyState(nextState)
+  showToast('外部日志同步文件夹已更新')
+}
+
+async function openInternalLogFolder() {
+  await window.bodyReset.openDataFolder()
+  showToast('已打开程序内部日志文件夹')
+}
+
+async function openExternalLogFolder() {
+  const status = await window.bodyReset.openExternalLogFolder()
+  externalLogSyncStatus.value = status
+  if (!status.configured) {
+    showToast('请先选择外部日志同步文件夹')
+    return
+  }
+  showToast('已打开外部日志同步文件夹')
+}
+
+async function syncExternalLogs() {
+  const status = await window.bodyReset.syncExternalLogs()
+  externalLogSyncStatus.value = status
+  showToast(status.lastError ? '外部同步失败，内部日志仍已保留' : '外部日志已同步')
+}
+
+function queueMediaVolumeSave(key: 'resetVolume' | 'sleepReminderVolume', value: number) {
+  pendingMediaVolumeSave = { key, value }
+  if (mediaVolumeSaveHandle) {
+    window.clearTimeout(mediaVolumeSaveHandle)
+  }
+
+  mediaVolumeSaveHandle = window.setTimeout(() => {
+    const pending = pendingMediaVolumeSave
+    pendingMediaVolumeSave = null
+    mediaVolumeSaveHandle = null
+    if (!pending) return
+
+    const payloadSettings = resetPayload.value?.settings || reminderPayload.value?.settings
+    const baseSettings = payloadSettings || settings.value
+    if (payloadSettings) {
+      payloadSettings[pending.key] = pending.value
+    } else {
+      settings.value[pending.key] = pending.value
+    }
+    void queueSettingsSave({ ...baseSettings, [pending.key]: pending.value })
+  }, 250)
 }
 
 async function openVideoFolder() {
@@ -423,6 +601,13 @@ async function refreshVideos(showMessage = true) {
   }
 }
 
+async function openSleepReminderFolder() {
+  const library = await window.bodyReset.openSleepReminderFolder()
+  sleepReminderVideoFolderPath.value = library.folderPath
+  sleepReminderVideoCount.value = library.count
+  showToast('睡眠提醒视频文件夹已打开')
+}
+
 function onFocusMinutesChange() {
   settings.value.focusMinutes = clamp(settings.value.focusMinutes, 1, 240)
   if (timerMode.value === 'idle') {
@@ -441,6 +626,11 @@ function onEmergencySecondsChange() {
   saveSettings()
 }
 
+function onSleepReminderIntervalChange() {
+  settings.value.sleepReminderInterval = clamp(settings.value.sleepReminderInterval, 5, 240)
+  void saveSettings()
+}
+
 function clamp(value: number, min: number, max: number) {
   const next = Number.isFinite(value) ? Math.round(value) : min
   return Math.min(max, Math.max(min, next))
@@ -448,6 +638,7 @@ function clamp(value: number, min: number, max: number) {
 
 async function loadResetPayload() {
   resetPayload.value = await window.bodyReset.getResetPayload()
+  resetVolume.value = clampVolume(resetPayload.value.settings.resetVolume)
   emergencyLeft.value = resetPayload.value.settings.emergencyExitSeconds
 
   if (!resetPayload.value.video) {
@@ -463,9 +654,11 @@ async function loadResetPayload() {
   const video = videoRef.value
   if (!video) return
   video.volume = resetVolume.value
+  video.muted = resetVolume.value <= 0
 
   try {
     await video.play()
+    resetIsPlaying.value = true
   } catch {
     resetStage.value = 'manual-play'
     resetNotice.value = '点击画面开始播放。'
@@ -476,23 +669,122 @@ function playResetVideo() {
   const video = videoRef.value
   if (!video) return
   video.volume = resetVolume.value
+  video.muted = resetVolume.value <= 0
   video
     .play()
     .then(() => {
       resetStage.value = 'playing'
+      resetIsPlaying.value = true
       resetNotice.value = '跟着视频慢慢复位。'
     })
     .catch(() => startFallback())
 }
 
+function toggleResetVideo() {
+  const video = videoRef.value
+  if (!video) return
+  if (video.paused) {
+    playResetVideo()
+    return
+  }
+
+  video.pause()
+  resetIsPlaying.value = false
+  resetNotice.value = '视频已暂停，准备好后继续播放。'
+}
+
 function onVideoEnded() {
   resetStage.value = 'ended'
   canCompleteReset.value = true
+  resetIsPlaying.value = false
   resetNotice.value = '复位完成，可以回到工作。'
 }
 
 function onVideoError() {
   startFallback()
+}
+
+async function loadReminderPayload() {
+  reminderPayload.value = await window.bodyReset.getReminderPayload()
+  if (reminderPayload.value) {
+    reminderVolume.value = clampVolume(reminderPayload.value.settings.sleepReminderVolume)
+  }
+  if (!reminderPayload.value?.video) return
+
+  await nextTick()
+  const video = reminderVideoRef.value
+  if (!video) return
+  video.volume = reminderVolume.value
+  video.muted = reminderVolume.value <= 0
+  try {
+    await video.play()
+    reminderIsPlaying.value = true
+  } catch {
+    reminderIsPlaying.value = false
+  }
+}
+
+function toggleReminderVideo() {
+  const video = reminderVideoRef.value
+  if (!video) return
+  if (video.paused) {
+    video.play().then(() => {
+      reminderIsPlaying.value = true
+    }).catch(() => {
+      reminderIsPlaying.value = false
+    })
+    return
+  }
+
+  video.pause()
+  reminderIsPlaying.value = false
+}
+
+function emergencyCloseReminder() {
+  void window.bodyReset.emergencyCloseReminder()
+}
+
+function onReminderKeyDown(event: KeyboardEvent) {
+  if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+    event.preventDefault()
+    event.stopPropagation()
+    adjustReminderVolume(event.key === 'ArrowUp' ? 1 : -1)
+    return
+  }
+
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    if (reminderEmergencyHolding.value) return
+    reminderEmergencyHolding.value = true
+    reminderEmergencyLeft.value = reminderPayload.value?.settings.emergencyExitSeconds || 5
+    reminderEmergencyHandle = window.setInterval(() => {
+      reminderEmergencyLeft.value -= 1
+      if (reminderEmergencyLeft.value <= 0) {
+        clearReminderEmergencyHold()
+        emergencyCloseReminder()
+      }
+    }, 1000)
+    return
+  }
+
+  if (event.key === ' ' || event.key === 'Enter') {
+    event.preventDefault()
+    toggleReminderVideo()
+  }
+}
+
+function onReminderKeyUp(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    clearReminderEmergencyHold()
+  }
+}
+
+function clearReminderEmergencyHold() {
+  reminderEmergencyHolding.value = false
+  if (reminderEmergencyHandle) {
+    window.clearInterval(reminderEmergencyHandle)
+    reminderEmergencyHandle = null
+  }
 }
 
 function startFallback() {
@@ -522,24 +814,42 @@ function adjustResetVolume(direction: 1 | -1) {
   const video = videoRef.value
   if (!video) return
 
-  const nextVolume = clampVolume(video.volume + direction * 0.1)
+  const currentVolume = video.muted ? resetVolume.value : video.volume
+  const nextVolume = clampVolume(currentVolume + direction * 0.1)
   video.volume = nextVolume
-  video.muted = nextVolume === 0
+  video.muted = nextVolume <= 0
   resetVolume.value = nextVolume
+  queueMediaVolumeSave('resetVolume', nextVolume)
+}
+
+function adjustReminderVolume(direction: 1 | -1) {
+  const video = reminderVideoRef.value
+  if (!video) return
+
+  const currentVolume = video.muted ? reminderVolume.value : video.volume
+  const nextVolume = clampVolume(currentVolume + direction * 0.1)
+  video.volume = nextVolume
+  video.muted = nextVolume <= 0
+  reminderVolume.value = nextVolume
+  queueMediaVolumeSave('sleepReminderVolume', nextVolume)
 }
 
 function clampVolume(value: number) {
-  return Math.min(1, Math.max(0, Math.round(value * 10) / 10))
+  const next = Number(value)
+  if (!Number.isFinite(next)) return 1
+  return Math.min(1, Math.max(0, Math.round(next * 10) / 10))
 }
 
 function onResetKeyDown(event: KeyboardEvent) {
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
     event.preventDefault()
+    event.stopPropagation()
     adjustResetVolume(event.key === 'ArrowUp' ? 1 : -1)
     return
   }
 
   if (event.key !== 'Escape' || emergencyHolding.value) return
+  event.preventDefault()
   emergencyHolding.value = true
   emergencyLeft.value = resetPayload.value?.settings.emergencyExitSeconds || 5
   emergencyHandle = window.setInterval(async () => {
@@ -573,14 +883,23 @@ watch(
 )
 
 onMounted(() => {
+  if (isReminderView) {
+    loadReminderPayload()
+    document.addEventListener('keydown', onReminderKeyDown, true)
+    document.addEventListener('keyup', onReminderKeyUp, true)
+    return
+  }
+
   if (isResetView) {
     loadResetPayload()
-    window.addEventListener('keydown', onResetKeyDown)
-    window.addEventListener('keyup', onResetKeyUp)
+    document.addEventListener('keydown', onResetKeyDown, true)
+    document.addEventListener('keyup', onResetKeyUp, true)
     return
   }
 
   loadMainState()
+  removeSuspendListener = window.bodyReset.onSystemSuspend(handleSystemSuspend)
+  removeResumeListener = window.bodyReset.onSystemResume(handleSystemResume)
   removeResetListener = window.bodyReset.onResetCompleted((payload) => {
     remainingMs.value = totalFocusMs.value
     if (payload.todayStats) {
@@ -602,17 +921,33 @@ onMounted(() => {
 onBeforeUnmount(() => {
   clearTicker()
   void flushFocusStats()
+  if (mediaVolumeSaveHandle) {
+    window.clearTimeout(mediaVolumeSaveHandle)
+    mediaVolumeSaveHandle = null
+  }
+  if (pendingMediaVolumeSave) {
+    const pending = pendingMediaVolumeSave
+    pendingMediaVolumeSave = null
+    const payloadSettings = resetPayload.value?.settings || reminderPayload.value?.settings
+    const baseSettings = payloadSettings || settings.value
+    void queueSettingsSave({ ...baseSettings, [pending.key]: pending.value })
+  }
   clearEmergencyHold()
   if (fallbackHandle) window.clearInterval(fallbackHandle)
   if (toastHandle) window.clearTimeout(toastHandle)
   if (removeResetListener) removeResetListener()
-  window.removeEventListener('keydown', onResetKeyDown)
-  window.removeEventListener('keyup', onResetKeyUp)
+  if (removeSuspendListener) removeSuspendListener()
+  if (removeResumeListener) removeResumeListener()
+  document.removeEventListener('keydown', onResetKeyDown, true)
+  document.removeEventListener('keyup', onResetKeyUp, true)
+  document.removeEventListener('keydown', onReminderKeyDown, true)
+  document.removeEventListener('keyup', onReminderKeyUp, true)
+  clearReminderEmergencyHold()
 })
 </script>
 
 <template>
-  <main v-if="!isResetView" class="app-shell">
+  <main v-if="!isResetView && !isReminderView" class="app-shell">
     <section class="focus-surface" aria-label="专注计时">
       <div class="topbar">
         <div class="brand-block">
@@ -851,6 +1186,46 @@ onBeforeUnmount(() => {
 
             <label class="toggle-row">
               <span>
+                <strong>睡眠提醒</strong>
+                <small>在设定时段内，电脑仍在使用时全屏提醒</small>
+              </span>
+              <input v-model="settings.sleepReminderEnabled" type="checkbox" @change="saveSettings" />
+            </label>
+
+            <div class="setting-group" :class="{ disabled: !settings.sleepReminderEnabled }">
+              <div class="setting-group-title">睡眠提醒时段</div>
+              <div class="time-range-row">
+                <label class="setting-row compact">
+                  <span>从</span>
+                  <input v-model="settings.sleepReminderStart" type="time" @change="saveSettings" />
+                </label>
+                <label class="setting-row compact">
+                  <span>到</span>
+                  <input v-model="settings.sleepReminderEnd" type="time" @change="saveSettings" />
+                </label>
+              </div>
+              <label class="setting-row">
+                <span>提醒间隔</span>
+                <input
+                  v-model.number="settings.sleepReminderInterval"
+                  type="number"
+                  min="5"
+                  max="240"
+                  @change="onSleepReminderIntervalChange"
+                />
+                <small>分钟</small>
+              </label>
+              <button class="wide-button" type="button" @click="openSleepReminderFolder">
+                <FolderOpen :size="18" />
+                <span>打开睡眠提醒视频（{{ sleepReminderVideoCount }} 个）</span>
+              </button>
+              <p class="folder-path compact-path">
+                {{ sleepReminderVideoFolderPath || settings.sleepReminderFolder }}
+              </p>
+            </div>
+
+            <label class="toggle-row">
+              <span>
                 <strong>最小化到托盘</strong>
                 <small>关闭窗口时留在后台</small>
               </span>
@@ -864,6 +1239,41 @@ onBeforeUnmount(() => {
               </span>
               <input v-model="settings.autoStart" type="checkbox" @change="saveSettings" />
             </label>
+
+            <div class="setting-group external-log-group">
+              <div class="setting-group-title">外部日志同步（可选）</div>
+              <p class="setting-help">
+                程序始终把完整日志保存在自己的 data 文件夹。开启后，再复制一份到你选择的文件夹；别人可以保持关闭。
+              </p>
+              <label class="toggle-row">
+                <span>
+                  <strong>启用外部同步</strong>
+                  <small>适合个人复盘或备份</small>
+                </span>
+                <input v-model="settings.externalLogSyncEnabled" type="checkbox" @change="saveSettings" />
+              </label>
+              <button class="wide-button" type="button" @click="chooseExternalLogFolder">
+                <FolderOpen :size="18" />
+                <span>选择外部同步文件夹</span>
+              </button>
+              <p class="folder-path compact-path">
+                {{ settings.externalLogSyncFolder || '尚未选择外部文件夹' }}
+              </p>
+              <p class="sync-status" :class="{ error: externalLogSyncStatus.lastError }">
+                {{ externalLogSyncStatusText }}
+              </p>
+              <div class="inline-actions">
+                <button class="secondary-button" type="button" @click="syncExternalLogs">
+                  立即同步
+                </button>
+                <button class="plain-button" type="button" @click="openInternalLogFolder">
+                  内部日志
+                </button>
+              </div>
+              <button class="wide-button" type="button" @click="openExternalLogFolder">
+                打开外部同步文件夹
+              </button>
+            </div>
 
             <label class="setting-row">
               <span>紧急退出</span>
@@ -884,7 +1294,7 @@ onBeforeUnmount(() => {
     <p v-if="toast" class="toast">{{ toast }}</p>
   </main>
 
-  <main v-else class="reset-shell" :class="resetStage">
+  <main v-else-if="isResetView" class="reset-shell" :class="resetStage">
     <video
       v-if="resetPayload?.video"
       ref="videoRef"
@@ -892,7 +1302,9 @@ onBeforeUnmount(() => {
       :src="resetPayload.video.url"
       autoplay
       playsinline
-      @click="playResetVideo"
+      @click="toggleResetVideo"
+      @play="resetIsPlaying = true"
+      @pause="resetIsPlaying = false"
       @ended="onVideoEnded"
       @error="onVideoError"
     ></video>
@@ -936,6 +1348,59 @@ onBeforeUnmount(() => {
         <Check :size="18" />
         <span>{{ resetButtonText }}</span>
       </button>
+      <div v-if="resetPayload?.video && resetStage !== 'fallback'" class="reset-media-controls">
+        <button class="video-toggle-button" type="button" @click="toggleResetVideo">
+          <Pause v-if="resetIsPlaying" :size="16" />
+          <Play v-else :size="16" />
+          <span>{{ resetIsPlaying ? '暂停视频' : '继续播放' }}</span>
+        </button>
+        <div class="volume-controls" aria-label="普通复位视频音量">
+          <button type="button" title="降低音量" @click="adjustResetVolume(-1)">−</button>
+          <span>音量 {{ resetVolumeText }}</span>
+          <button type="button" title="提高音量" @click="adjustResetVolume(1)">+</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <main v-else class="reminder-shell">
+    <video
+      v-if="reminderPayload?.video"
+      ref="reminderVideoRef"
+      class="reminder-video"
+      :src="reminderPayload.video.url"
+      autoplay
+      playsinline
+      loop
+      @click="toggleReminderVideo"
+      @play="reminderIsPlaying = true"
+      @pause="reminderIsPlaying = false"
+    ></video>
+
+    <div class="reminder-overlay">
+      <div class="reminder-copy">
+        <span class="reminder-kicker">睡眠提醒</span>
+        <h1>该睡觉了，先把身体放回去。</h1>
+        <p>视频会循环播放，只有长按 Esc 才能紧急退出。退出后 5 分钟，如果电脑仍在使用，会再次提醒。</p>
+      </div>
+      <div class="reminder-actions">
+        <div class="reminder-media-controls">
+          <button class="reminder-play-button" type="button" @click="toggleReminderVideo">
+            <Pause v-if="reminderIsPlaying" :size="18" />
+            <Play v-else :size="18" />
+            <span>{{ reminderIsPlaying ? '暂停视频' : '继续播放' }}</span>
+          </button>
+          <div class="volume-controls" aria-label="睡眠提醒视频音量">
+            <button type="button" title="降低音量" @click="adjustReminderVolume(-1)">−</button>
+            <span>音量 {{ reminderVolumeText }}</span>
+            <button type="button" title="提高音量" @click="adjustReminderVolume(1)">+</button>
+          </div>
+        </div>
+        <div class="reminder-emergency-note">
+          <span v-if="reminderEmergencyHolding">继续按住 Esc：{{ reminderEmergencyLeft }} 秒</span>
+          <span v-else>必须离开时长按 Esc 紧急退出</span>
+        </div>
+      </div>
     </div>
   </main>
 </template>

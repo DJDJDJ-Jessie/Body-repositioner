@@ -8,27 +8,54 @@ declare global {
       chooseVideoFolder: () => Promise<AppState>
       openVideoFolder: () => Promise<VideoLibrary>
       scanVideos: () => Promise<VideoLibrary>
+      scanSleepReminderVideos: () => Promise<ReminderVideoLibrary>
+      openSleepReminderFolder: () => Promise<ReminderVideoLibrary>
+      openDataFolder: () => Promise<ExternalLogSyncStatus>
+      chooseExternalLogFolder: () => Promise<AppState>
+      openExternalLogFolder: () => Promise<ExternalLogSyncStatus>
+      syncExternalLogs: () => Promise<ExternalLogSyncStatus>
       addFocusTime: (ms: number) => Promise<TodayStats>
       getStatsTable: (period: StatsPeriod) => Promise<StatsTable>
       beginReset: () => Promise<ResetPayload>
       getResetPayload: () => Promise<ResetPayload>
       completeReset: (payload: { videoName?: string }) => Promise<{ completed: boolean }>
       emergencyCloseReset: () => Promise<{ completed: boolean }>
+      getReminderPayload: () => Promise<ReminderPayload | null>
+      emergencyCloseReminder: () => Promise<{ closed: boolean; nextReminderAt: number }>
       setAutoStart: (enabled: boolean) => Promise<AppSettings>
       onResetCompleted: (
         callback: (payload: { completed: boolean; videoName?: string; todayStats?: TodayStats }) => void,
       ) => () => void
+      onSystemSuspend: (callback: () => void) => () => void
+      onSystemResume: (callback: () => void) => () => void
     }
   }
 
   type AppSettings = {
     focusMinutes: number
     resetMinutes: number
+    resetVolume: number
+    sleepReminderVolume: number
     videoFolder: string
+    sleepReminderEnabled: boolean
+    sleepReminderStart: string
+    sleepReminderEnd: string
+    sleepReminderInterval: number
+    sleepReminderFolder: string
     strictMode: boolean
     minimizeToTray: boolean
     autoStart: boolean
     emergencyExitSeconds: number
+    externalLogSyncEnabled: boolean
+    externalLogSyncFolder: string
+  }
+
+  type ExternalLogSyncStatus = {
+    enabled: boolean
+    folderPath: string
+    configured: boolean
+    lastSyncedAt: string | null
+    lastError: string | null
   }
 
   type VideoItem = {
@@ -83,6 +110,12 @@ declare global {
     videos: VideoItem[]
   }
 
+  type ReminderVideoLibrary = {
+    folderPath: string
+    count: number
+    videos: VideoItem[]
+  }
+
   type AppState = {
     appRoot: string
     dataDir: string
@@ -94,12 +127,23 @@ declare global {
     matchedVideoFolderName: string | null
     videos: VideoItem[]
     videoCount: number
+    sleepReminderVideoFolderPath: string
+    sleepReminderVideoCount: number
     todayStats: TodayStats
+    externalLogSyncStatus: ExternalLogSyncStatus
     shouldAutoStartTimer: boolean
   }
 
   type ResetPayload = {
     id: number
+    video: VideoItem | null
+    settings: AppSettings
+    canClose: boolean
+  }
+
+  type ReminderPayload = {
+    id: number
+    startedAt: number
     video: VideoItem | null
     settings: AppSettings
     canClose: boolean

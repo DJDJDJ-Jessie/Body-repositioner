@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#14231d" />
+    <meta name="description" content="身体复位器：把专注节奏和一次真正的身体复位连在一起。" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./icon.svg" />
+    <link rel="stylesheet" href="./styles.css" />
+    <title>身体复位器 · 手机版</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <div>
+            <p class="eyebrow">BODY RESET / MOBILE</p>
+            <h1>身体复位器</h1>
+          </div>
+        </div>
+        <button class="icon-button" id="settings-button" aria-label="打开设置">☷</button>
+      </header>
+
+      <main id="screen" class="screen" tabindex="-1"></main>
+
+      <nav class="bottom-nav" aria-label="主导航">
+        <button class="nav-item active" data-view="today">
+          <span class="nav-icon">○</span>
+          <span>今日</span>
+        </button>
+        <button class="nav-item" data-view="reset">
+          <span class="nav-icon">↗</span>
+          <span>复位库</span>
+        </button>
+        <button class="nav-item" data-view="ledger">
+          <span class="nav-icon">▦</span>
+          <span>账本</span>
+        </button>
+      </nav>
+    </div>
+
+    <div id="modal-root"></div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <input id="video-input" class="visually-hidden" type="file" accept="video/*" />
+
+    <script src="./app.js"></script>
+  </body>
+</html>
