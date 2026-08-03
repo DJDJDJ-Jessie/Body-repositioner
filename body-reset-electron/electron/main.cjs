@@ -1008,21 +1008,54 @@ function pauseActiveMedia() {
   if (process.platform !== 'win32') return;
 
   const script = `
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class BodyResetMediaKeys {
-  [DllImport("user32.dll")]
-  public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+$ErrorActionPreference = 'Stop'
+
+function Wait-WinRtResult {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object]$Operation,
+    [Parameter(Mandatory = $true)]
+    [Type]$ResultType
+  )
+
+  $asTaskMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+    Where-Object {
+      $_.Name -eq 'AsTask' -and
+      $_.IsGenericMethodDefinition -and
+      $_.GetGenericArguments().Count -eq 1 -and
+      $_.GetParameters().Count -eq 1
+    } |
+    Select-Object -First 1
+
+  if ($null -eq $asTaskMethod) {
+    throw 'Windows Runtime task bridge is unavailable'
+  }
+
+  $task = $asTaskMethod.MakeGenericMethod($ResultType).Invoke($null, @($Operation))
+  return $task.GetAwaiter().GetResult()
 }
-'@
-[BodyResetMediaKeys]::keybd_event(0xB3, 0, 0, [UIntPtr]::Zero)
-[BodyResetMediaKeys]::keybd_event(0xB3, 0, 2, [UIntPtr]::Zero)
+
+try {
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+  $managerType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime]
+  $manager = Wait-WinRtResult -Operation $managerType::RequestAsync() -ResultType $managerType
+  $session = $manager.GetCurrentSession()
+  if ($null -eq $session) { exit 0 }
+
+  $playbackInfo = $session.GetPlaybackInfo()
+  $playingStatus = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus]::Playing
+  if ($playbackInfo.PlaybackStatus -ne $playingStatus) { exit 0 }
+
+  Wait-WinRtResult -Operation $session.TryPauseAsync() -ResultType ([System.Boolean]) | Out-Null
+} catch {
+  # If the media session API is unavailable, do nothing rather than sending a toggle key.
+}
 `;
 
+  const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
   const child = spawn(
     'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script],
+    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encodedScript],
     { windowsHide: true, stdio: 'ignore' },
   );
   child.unref();
