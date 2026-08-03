@@ -248,6 +248,7 @@ let isSystemLocked = false
 let mainStateLoaded = false
 let autoResumeHandle: number | null = null
 let earlyResetHandle: number | null = null
+let resetMediaFailureHandled = false
 const autoResumeAfterPauseMs = 5 * 60_000
 const totalFocusMs = computed(() => settings.value.focusMinutes * 60_000)
 const elapsedMs = computed(() => Math.max(0, totalFocusMs.value - remainingMs.value))
@@ -760,6 +761,8 @@ function clamp(value: number, min: number, max: number) {
 }
 
 async function loadResetPayload() {
+  resetMediaFailureHandled = false
+  clearFallbackTimer()
   resetPayload.value = await window.bodyReset.getResetPayload()
   resetVolume.value = clampVolume(resetPayload.value.settings.resetVolume)
   emergencyLeft.value = resetPayload.value.settings.emergencyExitSeconds
@@ -862,13 +865,19 @@ function toggleResetVideo() {
   resetNotice.value = '视频已暂停，准备好后继续播放。'
 }
 
-function onVideoEnded() {
+function finalizeResetPlayback() {
   clearEarlyResetTimer()
+  clearFallbackTimer()
   earlyResetRemainingMs.value = 0
   resetStage.value = 'ended'
   canCompleteReset.value = true
   resetIsPlaying.value = false
   resetNotice.value = '复位完成，可以回到工作。'
+}
+
+function onVideoEnded() {
+  if (resetStage.value === 'fallback') return
+  finalizeResetPlayback()
 }
 
 function onVideoError() {
@@ -958,7 +967,34 @@ function clearReminderEmergencyHold() {
   }
 }
 
+function stopResetVideoSource() {
+  const video = videoRef.value
+  if (!video) return
+  video.pause()
+  video.removeAttribute('autoplay')
+  video.removeAttribute('src')
+  video.load()
+  resetIsPlaying.value = false
+}
+
+function clearFallbackTimer() {
+  if (fallbackHandle) {
+    window.clearInterval(fallbackHandle)
+    fallbackHandle = null
+  }
+}
+
 function startFallback() {
+  if (
+    resetMediaFailureHandled ||
+    resetStage.value === 'fallback' ||
+    resetStage.value === 'ended' ||
+    resetStage.value === 'empty'
+  ) {
+    return
+  }
+  resetMediaFailureHandled = true
+  stopResetVideoSource()
   resetStage.value = 'fallback'
   updateEarlyResetAvailability()
   if (earlyResetRemainingMs.value > 0) {
@@ -966,13 +1002,12 @@ function startFallback() {
   }
   fallbackRemaining.value = Math.max(15, (resetPayload.value?.settings.resetMinutes || 1) * 60)
   resetNotice.value = '视频无法播放，等待结束后可返回。'
-  if (fallbackHandle) window.clearInterval(fallbackHandle)
+  clearFallbackTimer()
   fallbackHandle = window.setInterval(() => {
     fallbackRemaining.value -= 1
     if (fallbackRemaining.value <= 0) {
-      if (fallbackHandle) window.clearInterval(fallbackHandle)
-      fallbackHandle = null
-      onVideoEnded()
+      clearFallbackTimer()
+      finalizeResetPlayback()
     }
   }, 1000)
 }
@@ -1126,7 +1161,7 @@ onBeforeUnmount(() => {
     void queueSettingsSave({ ...baseSettings, [pending.key]: pending.value })
   }
   clearEmergencyHold()
-  if (fallbackHandle) window.clearInterval(fallbackHandle)
+  clearFallbackTimer()
   if (toastHandle) window.clearTimeout(toastHandle)
   if (removeResetListener) removeResetListener()
   if (removeSuspendListener) removeSuspendListener()
@@ -1528,7 +1563,7 @@ onBeforeUnmount(() => {
       ref="videoRef"
       class="reset-video"
       :src="resetPayload.video.url"
-      autoplay
+      :autoplay="resetStage === 'playing'"
       playsinline
       @click="toggleResetVideo"
       @play="resetIsPlaying = true"
