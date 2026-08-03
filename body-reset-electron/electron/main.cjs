@@ -10,7 +10,7 @@ const {
   shell,
   Tray,
 } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -62,10 +62,11 @@ const defaultSettings = {
   sleepReminderEnabled: false,
   sleepReminderStart: '23:00',
   sleepReminderEnd: '07:00',
-  sleepReminderInterval: 30,
+  sleepReminderInterval: 5,
   sleepReminderFolder: 'sleep-reminders',
   strictMode: true,
   autoStartWhenUnlocked: true,
+  autoStartAfterSleep: true,
   earlyResetEnabled: false,
   earlyResetMinutes: 3,
   minimizeToTray: true,
@@ -82,20 +83,36 @@ let tray = null;
 let isQuitting = false;
 let pendingResetPayload = null;
 let pendingReminderPayload = null;
+let pendingResumeFromSleep = false;
 let settingsCache = null;
 let appIcon = null;
 let reminderTimer = null;
 let nextReminderAt = 0;
+let sleepReminderWindowKey = '';
+let sleepReminderEscalationLevel = 0;
+let activeSleepReminderIntervalMinutes = 0;
+const sleepReminderMaximumIntervalMinutes = 5;
+const sleepReminderFollowUpIntervalMinutes = 1;
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, commandLine) => {
+    const isResumeFromSleep = commandLine.includes('--resume-from-sleep');
+    if (isResumeFromSleep) {
+      pendingResumeFromSleep = true;
+    }
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
+    if (isResumeFromSleep) {
+      if (!mainWindow.webContents.isLoading()) {
+        mainWindow.webContents.send('system:resume-from-sleep');
+        pendingResumeFromSleep = false;
+      }
+    }
   });
 }
 
@@ -206,8 +223,8 @@ function normalizeSettings(input) {
     sleepReminderEnd: normalizeTimeValue(merged.sleepReminderEnd, defaultSettings.sleepReminderEnd),
     sleepReminderInterval: clampInt(
       merged.sleepReminderInterval,
-      5,
-      240,
+      1,
+      sleepReminderMaximumIntervalMinutes,
       defaultSettings.sleepReminderInterval,
     ),
     sleepReminderFolder:
@@ -216,6 +233,7 @@ function normalizeSettings(input) {
         : defaultSettings.sleepReminderFolder,
     strictMode: Boolean(merged.strictMode),
     autoStartWhenUnlocked: Boolean(merged.autoStartWhenUnlocked),
+    autoStartAfterSleep: Boolean(merged.autoStartAfterSleep),
     earlyResetEnabled: Boolean(merged.earlyResetEnabled),
     earlyResetMinutes: clampInt(
       merged.earlyResetMinutes,
@@ -270,16 +288,33 @@ function loadSettings() {
 function saveSettings(nextSettings) {
   const previousSettings = settingsCache;
   settingsCache = normalizeSettings(nextSettings);
+  const reminderScheduleChanged = Boolean(
+    previousSettings &&
+      (previousSettings.sleepReminderStart !== settingsCache.sleepReminderStart ||
+        previousSettings.sleepReminderEnd !== settingsCache.sleepReminderEnd ||
+        previousSettings.sleepReminderInterval !== settingsCache.sleepReminderInterval),
+  );
   writeJson(getSettingsPath(), settingsCache);
   ensureDir(getVideoFolderPath(settingsCache));
   ensureDir(getSleepReminderFolderPath(settingsCache));
-  if (
-    settingsCache.sleepReminderEnabled &&
-    (!previousSettings || !previousSettings.sleepReminderEnabled)
+  if (!settingsCache.sleepReminderEnabled) {
+    resetSleepReminderEscalation();
+    nextReminderAt = 0;
+  } else if (
+    !previousSettings ||
+    !previousSettings.sleepReminderEnabled ||
+    reminderScheduleChanged
   ) {
+    resetSleepReminderEscalation();
     nextReminderAt = Date.now() + settingsCache.sleepReminderInterval * 60_000;
   }
   applyAutoStart(settingsCache.autoStart);
+  if (
+    !previousSettings ||
+    previousSettings.autoStartAfterSleep !== settingsCache.autoStartAfterSleep
+  ) {
+    applySleepResumeAutoStart(settingsCache.autoStartAfterSleep);
+  }
   if (settingsCache.externalLogSyncEnabled) {
     syncExternalLogs(settingsCache);
   } else {
@@ -858,6 +893,9 @@ function addResetSession(completed, durationMs) {
 
 function shouldAutoStartTimer() {
   const settings = loadSettings();
+  if (process.argv.includes('--resume-from-sleep')) {
+    return settings.autoStartAfterSleep;
+  }
   if (!settings.autoStart) return false;
   if (process.argv.includes('--auto-start-timer')) return true;
 
@@ -883,28 +921,65 @@ function timeToMinutes(value) {
 }
 
 function isWithinSleepReminderWindow(date = new Date()) {
-  const settings = loadSettings();
+  return Boolean(getSleepReminderWindowKey(date));
+}
+
+function getSleepReminderWindowKey(date = new Date(), settings = loadSettings()) {
   const start = timeToMinutes(settings.sleepReminderStart);
   const end = timeToMinutes(settings.sleepReminderEnd);
-  if (start === null || end === null || start === end) return false;
+  if (start === null || end === null || start === end) return '';
 
   const current = date.getHours() * 60 + date.getMinutes();
-  return start < end ? current >= start && current < end : current >= start || current < end;
+  const insideWindow = start < end
+    ? current >= start && current < end
+    : current >= start || current < end;
+  if (!insideWindow) return '';
+
+  const windowDate = start > end && current < end ? addLocalDays(date, -1) : date;
+  return `${getLocalDateKey(windowDate)}:${start}-${end}`;
+}
+
+function resetSleepReminderEscalation() {
+  sleepReminderWindowKey = '';
+  sleepReminderEscalationLevel = 0;
+  activeSleepReminderIntervalMinutes = 0;
+}
+
+function getSleepReminderIntervalMinutes(settings = loadSettings()) {
+  if (sleepReminderEscalationLevel > 0) {
+    return sleepReminderFollowUpIntervalMinutes;
+  }
+
+  return Math.min(settings.sleepReminderInterval, sleepReminderMaximumIntervalMinutes);
 }
 
 function checkSleepReminderSchedule() {
   const settings = loadSettings();
-  if (!settings.sleepReminderEnabled || !isWithinSleepReminderWindow()) return;
+  const now = new Date();
+  const windowKey = getSleepReminderWindowKey(now, settings);
+  if (!settings.sleepReminderEnabled || !windowKey) {
+    resetSleepReminderEscalation();
+    return;
+  }
+  if (sleepReminderWindowKey !== windowKey) {
+    sleepReminderWindowKey = windowKey;
+    sleepReminderEscalationLevel = 0;
+    activeSleepReminderIntervalMinutes = 0;
+  }
+  if (isSystemLocked()) return;
   if (resetWindow && !resetWindow.isDestroyed()) return;
   if (reminderWindow && !reminderWindow.isDestroyed()) return;
 
-  const intervalMs = settings.sleepReminderInterval * 60_000;
   if (Date.now() < nextReminderAt) return;
 
   const video = pickNextSleepReminderVideo();
   if (!video) return;
 
-  nextReminderAt = Date.now() + intervalMs;
+  const intervalMinutes = getSleepReminderIntervalMinutes(settings);
+  sleepReminderEscalationLevel += 1;
+  activeSleepReminderIntervalMinutes = intervalMinutes;
+  const nextIntervalMinutes = getSleepReminderIntervalMinutes(settings);
+  nextReminderAt = Date.now() + intervalMinutes * 60_000;
   pendingReminderPayload = {
     id: Date.now(),
     startedAt: Date.now(),
@@ -912,11 +987,18 @@ function checkSleepReminderSchedule() {
     settings,
     canClose: false,
   };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('sleep-reminder:started', {
+      intervalMinutes,
+      nextIntervalMinutes,
+    });
+  }
   createReminderWindow();
 }
 
 function startSleepReminderSchedule() {
   if (reminderTimer) clearInterval(reminderTimer);
+  resetSleepReminderEscalation();
   const settings = loadSettings();
   nextReminderAt = Date.now() + settings.sleepReminderInterval * 60_000;
   reminderTimer = setInterval(checkSleepReminderSchedule, 15_000);
@@ -999,6 +1081,10 @@ function createMainWindow() {
   mainWindow.once('ready-to-show', () => {
     if (!mainWindow.isVisible()) {
       mainWindow.show();
+    }
+    if (pendingResumeFromSleep && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:resume-from-sleep');
+      pendingResumeFromSleep = false;
     }
   });
 
@@ -1176,6 +1262,57 @@ function applyAutoStart(enabled) {
   });
 }
 
+const sleepResumeTaskName = 'Body Reset Reminder - Resume from sleep';
+const sleepResumeEventQuery =
+  '*[System[Provider[@Name="Microsoft-Windows-Power-Troubleshooter"] and EventID=1]]';
+
+function applySleepResumeAutoStart(enabled) {
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+
+  if (!enabled) {
+    spawnSync('schtasks.exe', ['/Delete', '/TN', sleepResumeTaskName, '/F'], {
+      windowsHide: true,
+      encoding: 'utf8',
+      stdio: 'ignore',
+    });
+    return;
+  }
+
+  const executablePath = getLaunchExecutablePath().replace(/"/g, '""');
+  const taskRun = `"${executablePath}" --resume-from-sleep`;
+  const result = spawnSync(
+    'schtasks.exe',
+    [
+      '/Create',
+      '/SC',
+      'ONEVENT',
+      '/EC',
+      'System',
+      '/MO',
+      sleepResumeEventQuery,
+      '/TN',
+      sleepResumeTaskName,
+      '/TR',
+      taskRun,
+      '/IT',
+      '/RL',
+      'LIMITED',
+      '/DELAY',
+      '0000:05',
+      '/F',
+    ],
+    {
+      windowsHide: true,
+      encoding: 'utf8',
+    },
+  );
+
+  if (result.error || result.status !== 0) {
+    const details = result.error?.message || result.stderr || result.stdout || 'unknown error';
+    console.error('Failed to register sleep-resume task:', details);
+  }
+}
+
 ipcMain.handle('app:get-state', () => buildAppState());
 
 ipcMain.handle('stats:add-focus-time', (_event, ms) => addFocusTime(ms));
@@ -1285,7 +1422,12 @@ ipcMain.handle('reminder:emergency-close', () => {
     pendingReminderPayload.canClose = true;
   }
 
-  nextReminderAt = Date.now() + 5 * 60_000;
+  const settings = loadSettings();
+  const intervalMinutes = getSleepReminderIntervalMinutes(settings);
+  activeSleepReminderIntervalMinutes = intervalMinutes;
+  nextReminderAt = settings.sleepReminderEnabled
+    ? Date.now() + intervalMinutes * 60_000
+    : 0;
   if (reminderWindow && !reminderWindow.isDestroyed()) {
     reminderWindow.close();
   } else {
@@ -1372,6 +1514,7 @@ app.whenReady().then(() => {
   const startupSettings = loadSettings();
   ensurePortableDirs();
   applyAutoStart(startupSettings.autoStart);
+  applySleepResumeAutoStart(startupSettings.autoStartAfterSleep);
   if (startupSettings.externalLogSyncEnabled) {
     syncExternalLogs();
   }

@@ -26,6 +26,11 @@ contextBridge.exposeInMainWorld('bodyReset', {
     ipcRenderer.on('reset:completed', listener);
     return () => ipcRenderer.removeListener('reset:completed', listener);
   },
+  onSleepReminderStarted: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('sleep-reminder:started', listener);
+    return () => ipcRenderer.removeListener('sleep-reminder:started', listener);
+  },
   onSystemSuspend: (callback) => {
     const listener = () => callback();
     ipcRenderer.on('system:suspend', listener);
@@ -35,6 +40,11 @@ contextBridge.exposeInMainWorld('bodyReset', {
     const listener = () => callback();
     ipcRenderer.on('system:resume', listener);
     return () => ipcRenderer.removeListener('system:resume', listener);
+  },
+  onSystemResumeFromSleep: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('system:resume-from-sleep', listener);
+    return () => ipcRenderer.removeListener('system:resume-from-sleep', listener);
   },
   onSystemLock: (callback) => {
     const listener = () => callback();

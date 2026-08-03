@@ -29,6 +29,7 @@ type AppSettings = {
   sleepReminderFolder: string
   strictMode: boolean
   autoStartWhenUnlocked: boolean
+  autoStartAfterSleep: boolean
   earlyResetEnabled: boolean
   earlyResetMinutes: number
   minimizeToTray: boolean
@@ -132,10 +133,11 @@ const fallbackSettings: AppSettings = {
   sleepReminderEnabled: false,
   sleepReminderStart: '23:00',
   sleepReminderEnd: '07:00',
-  sleepReminderInterval: 30,
+  sleepReminderInterval: 5,
   sleepReminderFolder: 'sleep-reminders',
   strictMode: true,
   autoStartWhenUnlocked: true,
+  autoStartAfterSleep: true,
   earlyResetEnabled: false,
   earlyResetMinutes: 3,
   minimizeToTray: true,
@@ -229,8 +231,10 @@ let fallbackHandle: number | null = null
 let emergencyHandle: number | null = null
 let reminderEmergencyHandle: number | null = null
 let removeResetListener: (() => void) | null = null
+let removeSleepReminderListener: (() => void) | null = null
 let removeSuspendListener: (() => void) | null = null
 let removeResumeListener: (() => void) | null = null
+let removeResumeFromSleepListener: (() => void) | null = null
 let removeLockListener: (() => void) | null = null
 let removeUnlockListener: (() => void) | null = null
 let mediaVolumeSaveHandle: number | null = null
@@ -244,11 +248,13 @@ let isFlushingFocus = false
 let autoStartChecked = false
 let wasRunningBeforeSuspend = false
 let wasRunningBeforeLock = false
+let autoStartAfterResumePending = false
 let isSystemLocked = false
 let mainStateLoaded = false
 let autoResumeHandle: number | null = null
 let earlyResetHandle: number | null = null
 let resetMediaFailureHandled = false
+let sleepReminderPauseActive = false
 const autoResumeAfterPauseMs = 5 * 60_000
 const totalFocusMs = computed(() => settings.value.focusMinutes * 60_000)
 const elapsedMs = computed(() => Math.max(0, totalFocusMs.value - remainingMs.value))
@@ -403,12 +409,15 @@ async function loadMainState() {
   await loadStatsTable(false)
   if (!autoStartChecked) {
     autoStartChecked = true
-    if (nextState.shouldAutoStartTimer) {
+    if (nextState.shouldAutoStartTimer && !nextState.systemLocked) {
       remainingMs.value = totalFocusMs.value
       timerMode.value = 'running'
       startTicker()
       showToast('已随开机启动开始倒计时')
     }
+  }
+  if (nextState.shouldAutoStartTimer && nextState.systemLocked) {
+    autoStartAfterResumePending = true
   }
   mainStateLoaded = true
   if (!nextState.shouldAutoStartTimer) {
@@ -453,6 +462,8 @@ function clearAutoResume() {
 
 function startFocusTimer(message = '') {
   if (isSystemLocked || timerMode.value === 'waiting' || timerMode.value === 'running') return
+  sleepReminderPauseActive = false
+  autoStartAfterResumePending = false
   clearAutoResume()
   if (remainingMs.value <= 0) {
     remainingMs.value = totalFocusMs.value
@@ -468,6 +479,7 @@ function scheduleAutoResume() {
     !mainStateLoaded ||
     !settings.value.autoStartWhenUnlocked ||
     isSystemLocked ||
+    sleepReminderPauseActive ||
     timerMode.value !== 'paused'
   ) {
     return
@@ -486,7 +498,14 @@ function scheduleAutoResume() {
 }
 
 function maybeAutoStartWhenUnlocked() {
-  if (!mainStateLoaded || !settings.value.autoStartWhenUnlocked || isSystemLocked) return
+  if (
+    !mainStateLoaded ||
+    !settings.value.autoStartWhenUnlocked ||
+    isSystemLocked ||
+    sleepReminderPauseActive
+  ) {
+    return
+  }
   if (timerMode.value === 'paused') {
     scheduleAutoResume()
     return
@@ -551,12 +570,16 @@ function runPrimaryAction() {
   if (remainingMs.value <= 0) {
     remainingMs.value = totalFocusMs.value
   }
+  sleepReminderPauseActive = false
+  autoStartAfterResumePending = false
   clearAutoResume()
   timerMode.value = 'running'
   startTicker()
 }
 
 function resetTimer() {
+  sleepReminderPauseActive = false
+  autoStartAfterResumePending = false
   clearAutoResume()
   clearTicker()
   void flushFocusStats()
@@ -571,9 +594,29 @@ async function beginReset() {
   await window.bodyReset.beginReset()
 }
 
+function handleSleepReminderStarted(payload?: {
+  intervalMinutes?: number
+  nextIntervalMinutes?: number
+}) {
+  if (isResetView || isReminderView) return
+  sleepReminderPauseActive = true
+  autoStartAfterResumePending = false
+  clearAutoResume()
+  if (timerMode.value !== 'running') return
+
+  timerMode.value = 'paused'
+  clearTicker()
+  void flushFocusStats()
+  const intervalText = payload?.nextIntervalMinutes
+    ? `，下次间隔将为 ${payload.nextIntervalMinutes} 分钟`
+    : ''
+  showToast(`睡眠提醒已开始，专注倒计时已暂停${intervalText}`)
+}
+
 function handleSystemSuspend() {
   if (isResetView || isReminderView) return
   clearAutoResume()
+  autoStartAfterResumePending = false
   wasRunningBeforeSuspend = timerMode.value === 'running'
   if (!wasRunningBeforeSuspend) return
 
@@ -583,12 +626,39 @@ function handleSystemSuspend() {
   showToast('电脑进入睡眠，倒计时已自动暂停')
 }
 
+function handleSystemResumeFromSleep() {
+  if (isResetView || isReminderView || !settings.value.autoStartAfterSleep) return
+  if (sleepReminderPauseActive) return
+  autoStartAfterResumePending = false
+  if (isSystemLocked) {
+    autoStartAfterResumePending = timerMode.value !== 'running' && timerMode.value !== 'waiting'
+    return
+  }
+  if (timerMode.value === 'running' || timerMode.value === 'waiting') return
+
+  clearAutoResume()
+  startFocusTimer('电脑从睡眠恢复，已自动开启专注倒计时')
+}
+
 function handleSystemResume() {
   if (isResetView || isReminderView) return
   const shouldResume = wasRunningBeforeSuspend
   wasRunningBeforeSuspend = false
+  if (sleepReminderPauseActive) {
+    wasRunningBeforeLock = false
+    autoStartAfterResumePending = false
+    clearAutoResume()
+    return
+  }
   if (shouldResume && isSystemLocked) {
     wasRunningBeforeLock = true
+    return
+  }
+  if (isSystemLocked) {
+    autoStartAfterResumePending =
+      settings.value.autoStartAfterSleep &&
+      timerMode.value !== 'running' &&
+      timerMode.value !== 'waiting'
     return
   }
   if (shouldResume) {
@@ -598,12 +668,24 @@ function handleSystemResume() {
     return
   }
 
+  if (
+    settings.value.autoStartAfterSleep &&
+    !isSystemLocked &&
+    timerMode.value !== 'running' &&
+    timerMode.value !== 'waiting'
+  ) {
+    clearAutoResume()
+    startFocusTimer('电脑从睡眠恢复，已检查并自动开启专注倒计时')
+    return
+  }
+
   maybeAutoStartWhenUnlocked()
 }
 
 function handleSystemLock() {
   if (isResetView || isReminderView || isSystemLocked) return
   isSystemLocked = true
+  autoStartAfterResumePending = false
   clearAutoResume()
   wasRunningBeforeLock = timerMode.value === 'running'
   if (!wasRunningBeforeLock) return
@@ -616,12 +698,29 @@ function handleSystemLock() {
 function handleSystemUnlock() {
   if (isResetView || isReminderView) return
   isSystemLocked = false
+  if (sleepReminderPauseActive) {
+    autoStartAfterResumePending = false
+    return
+  }
   if (wasRunningBeforeLock) {
     wasRunningBeforeLock = false
     timerMode.value = 'running'
     startTicker()
     showToast('电脑已解锁，倒计时已自动继续')
     return
+  }
+
+  if (autoStartAfterResumePending) {
+    autoStartAfterResumePending = false
+    if (
+      settings.value.autoStartAfterSleep &&
+      timerMode.value !== 'running' &&
+      timerMode.value !== 'waiting'
+    ) {
+      clearAutoResume()
+      startFocusTimer('电脑从睡眠恢复并解锁，已自动开启专注倒计时')
+      return
+    }
   }
 
   maybeAutoStartWhenUnlocked()
@@ -751,7 +850,7 @@ function onEmergencySecondsChange() {
 }
 
 function onSleepReminderIntervalChange() {
-  settings.value.sleepReminderInterval = clamp(settings.value.sleepReminderInterval, 5, 240)
+  settings.value.sleepReminderInterval = clamp(settings.value.sleepReminderInterval, 1, 5)
   void saveSettings()
 }
 
@@ -1124,8 +1223,12 @@ onMounted(() => {
   }
 
   loadMainState()
+  removeSleepReminderListener = window.bodyReset.onSleepReminderStarted(handleSleepReminderStarted)
   removeSuspendListener = window.bodyReset.onSystemSuspend(handleSystemSuspend)
   removeResumeListener = window.bodyReset.onSystemResume(handleSystemResume)
+  removeResumeFromSleepListener = window.bodyReset.onSystemResumeFromSleep(
+    handleSystemResumeFromSleep,
+  )
   removeLockListener = window.bodyReset.onSystemLock(handleSystemLock)
   removeUnlockListener = window.bodyReset.onSystemUnlock(handleSystemUnlock)
   removeResetListener = window.bodyReset.onResetCompleted((payload) => {
@@ -1164,8 +1267,10 @@ onBeforeUnmount(() => {
   clearFallbackTimer()
   if (toastHandle) window.clearTimeout(toastHandle)
   if (removeResetListener) removeResetListener()
+  if (removeSleepReminderListener) removeSleepReminderListener()
   if (removeSuspendListener) removeSuspendListener()
   if (removeResumeListener) removeResumeListener()
+  if (removeResumeFromSleepListener) removeResumeFromSleepListener()
   if (removeLockListener) removeLockListener()
   if (removeUnlockListener) removeUnlockListener()
   clearAutoResume()
@@ -1460,16 +1565,19 @@ onBeforeUnmount(() => {
                 </label>
               </div>
               <label class="setting-row">
-                <span>提醒间隔</span>
+                <span>首次提醒间隔</span>
                 <input
                   v-model.number="settings.sleepReminderInterval"
                   type="number"
-                  min="5"
-                  max="240"
+                  min="1"
+                  max="5"
                   @change="onSleepReminderIntervalChange"
                 />
                 <small>分钟</small>
               </label>
+              <p class="setting-help">
+                首次间隔最多 5 分钟；第一次提醒后，后续每 1 分钟再次提醒，直到离开电脑。
+              </p>
               <button class="wide-button" type="button" @click="openSleepReminderFolder">
                 <FolderOpen :size="18" />
                 <span>打开睡眠提醒视频（{{ sleepReminderVideoCount }} 个）</span>
@@ -1501,6 +1609,14 @@ onBeforeUnmount(() => {
                 <small>电脑保持解锁时自动开始；手动暂停 5 分钟后会自动恢复</small>
               </span>
               <input v-model="settings.autoStartWhenUnlocked" type="checkbox" @change="saveSettings" />
+            </label>
+
+            <label class="toggle-row">
+              <span>
+                <strong>睡眠唤醒后自动启动</strong>
+                <small>Windows 从睡眠恢复时单独启动本程序，并检查是否需要开启倒计时</small>
+              </span>
+              <input v-model="settings.autoStartAfterSleep" type="checkbox" @change="saveSettings" />
             </label>
 
             <div class="setting-group external-log-group">
@@ -1647,7 +1763,7 @@ onBeforeUnmount(() => {
       <div class="reminder-copy">
         <span class="reminder-kicker">睡眠提醒</span>
         <h1>该睡觉了，先把身体放回去。</h1>
-        <p>视频会循环播放，只有长按 Esc 才能紧急退出。退出后 5 分钟，如果电脑仍在使用，会再次提醒。</p>
+        <p>视频会循环播放，只有长按 Esc 才能紧急退出。第一次退出后 1 分钟，如果电脑仍在使用，会再次提醒。</p>
       </div>
       <div class="reminder-actions">
         <div class="reminder-media-controls">

@@ -29,8 +29,12 @@ declare global {
       onResetCompleted: (
         callback: (payload: { completed: boolean; videoName?: string; todayStats?: TodayStats }) => void,
       ) => () => void
+      onSleepReminderStarted: (
+        callback: (payload: { intervalMinutes: number; nextIntervalMinutes: number }) => void,
+      ) => () => void
       onSystemSuspend: (callback: () => void) => () => void
       onSystemResume: (callback: () => void) => () => void
+      onSystemResumeFromSleep: (callback: () => void) => () => void
       onSystemLock: (callback: () => void) => () => void
       onSystemUnlock: (callback: () => void) => () => void
     }
@@ -49,6 +53,7 @@ declare global {
     sleepReminderFolder: string
     strictMode: boolean
     autoStartWhenUnlocked: boolean
+    autoStartAfterSleep: boolean
     earlyResetEnabled: boolean
     earlyResetMinutes: number
     minimizeToTray: boolean
