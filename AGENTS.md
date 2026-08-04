@@ -37,6 +37,7 @@
    - `node --check electron/main.cjs`；
    - `node --check electron/preload.cjs`；
    - `git diff --check`。
+   - 生成 Windows 文件夹版后，关闭正在运行的程序，并执行一次 `身体复位提醒器.exe --smoke-test-state`；必须确认退出码为 0。这个检查会真实读取设置、统计、普通视频目录和睡眠视频目录，不能只用 `node --check` 代替。
 5. 需要交付 Windows 文件夹版时，在 `body-reset-electron/` 运行 `npm run dist:folder`。构建输出位于 `body-reset-electron/release/win-unpacked/`。
 6. 更新 `便携版/` 时只替换程序文件和 `resources/`、`locales/` 等构建内容，必须保留 `data/`、`videos/`、`sleep-reminders/` 和使用说明。若旧 EXE 正在运行，先提示用户退出；清理旧版时优先使用 Windows 回收站，避免误删用户数据。
 7. 用户明确要求上传 GitHub 时：
@@ -64,6 +65,7 @@
 - 普通复位没有可播放视频时，不能立即放行或只给空目录提示；必须进入内置的文字休息流程（默认文案为“喝口水，起来动感一下”），按普通复位时长等待，并遵守普通复位提前返回开关。
 - 计时统计必须按实际运行/复位时长写入内部日志；外部日志同步是可选镜像，不能阻断核心功能。
 - 复位窗口的完成条件要同时在界面和主进程校验，不能只依赖按钮的 `disabled` 状态。
+- `buildAppState()` 中的视频扫描等可选子系统必须与设置读取隔离；某个视频文件或目录读取失败时，可以把该视频库暂时视为空，但不能让设置、统计和自动倒计时一起失效。
 
 ## 交付说明
 

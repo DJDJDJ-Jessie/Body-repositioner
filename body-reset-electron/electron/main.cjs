@@ -481,7 +481,7 @@ function scanVideos() {
 
   return {
     baseFolderPath: source.baseFolderPath,
-    folderPath,
+    folderPath: source.folderPath,
     sourceLabel: source.sourceLabel,
     sourceKind: source.sourceKind,
     matchedFolderName: source.matchedFolderName,
@@ -505,6 +505,37 @@ function scanSleepReminderVideos() {
     count: videos.length,
     videos,
   };
+}
+
+function scanVideosForAppState(settings) {
+  try {
+    return scanVideos();
+  } catch (error) {
+    console.error('Failed to scan reset videos while building app state:', error);
+    const baseFolderPath = getVideoFolderPath(settings);
+    return {
+      baseFolderPath,
+      folderPath: baseFolderPath,
+      sourceLabel: '视频目录暂时无法读取',
+      sourceKind: 'unavailable',
+      matchedFolderName: null,
+      count: 0,
+      videos: [],
+    };
+  }
+}
+
+function scanSleepReminderVideosForAppState(settings) {
+  try {
+    return scanSleepReminderVideos();
+  } catch (error) {
+    console.error('Failed to scan sleep-reminder videos while building app state:', error);
+    return {
+      folderPath: getSleepReminderFolderPath(settings),
+      count: 0,
+      videos: [],
+    };
+  }
 }
 
 function readVideoState() {
@@ -1125,8 +1156,8 @@ try {
 
 function buildAppState() {
   const settings = loadSettings();
-  const library = scanVideos();
-  const reminderLibrary = scanSleepReminderVideos();
+  const library = scanVideosForAppState(settings);
+  const reminderLibrary = scanSleepReminderVideosForAppState(settings);
   return {
     appRoot: getPortableRoot(),
     dataDir: getDataDir(),
@@ -1614,6 +1645,21 @@ app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   const startupSettings = loadSettings();
   ensurePortableDirs();
+  if (process.argv.includes('--smoke-test-state')) {
+    try {
+      const state = buildAppState();
+      const resetLibrary = scanVideos();
+      const sleepReminderLibrary = scanSleepReminderVideos();
+      if (!state.settings || !state.dataDir || resetLibrary.count < 0 || sleepReminderLibrary.count < 0) {
+        throw new Error('App state smoke test returned an incomplete result');
+      }
+      app.exit(0);
+    } catch (error) {
+      console.error('App state smoke test failed:', error);
+      app.exit(1);
+    }
+    return;
+  }
   applyAutoStart(startupSettings.autoStart);
   applySleepResumeAutoStart(startupSettings.autoStartAfterSleep);
   if (startupSettings.externalLogSyncEnabled) {

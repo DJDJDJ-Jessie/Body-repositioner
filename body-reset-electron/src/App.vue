@@ -418,7 +418,7 @@ async function loadMainState() {
     applyState(nextState)
   } catch (error) {
     console.error('Failed to load local app state:', error)
-    stateLoadError.value = '无法读取本地配置。请确认你打开的是便携版中的身体复位提醒器.exe。'
+    stateLoadError.value = '程序读取本地数据失败。你的配置文件没有被覆盖，请退出软件后重新打开。'
     showToast('本地配置读取失败，当前没有启动倒计时')
     return
   }
