@@ -65,6 +65,8 @@ npm run dist:folder
 
 `便携版/`、视频和数据不提交到代码仓库。exe 体积较大，适合通过 GitHub Releases 或其他附件方式发布。
 
+正式使用时请双击 `便携版/身体复位提醒器.exe`。`body-reset-electron/release/win-unpacked/` 是构建暂存目录，不应作为正式启动入口；直接打开网页或 Vite 预览时只会显示界面 mock，不会读取本地配置、视频或自动倒计时。
+
 ## 日志与外部同步
 
 程序始终把运行日志保存在当前便携版旁边的 `data/` 文件夹中：

@@ -136,14 +136,33 @@ function getPortableRoot() {
   }
 
   if (app.isPackaged) {
-    return path.dirname(process.execPath);
+    const executableDir = path.dirname(process.execPath);
+    if (path.basename(executableDir).toLowerCase() === 'win-unpacked') {
+      const workspacePortableRoot = path.resolve(executableDir, '..', '..', '..', '便携版');
+      if (fs.existsSync(path.join(workspacePortableRoot, 'data', 'settings.json'))) {
+        return workspacePortableRoot;
+      }
+    }
+    return executableDir;
   }
 
   return path.resolve(__dirname, '..', '..');
 }
 
 function getLaunchExecutablePath() {
-  return process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  if (process.env.PORTABLE_EXECUTABLE_FILE) {
+    return process.env.PORTABLE_EXECUTABLE_FILE;
+  }
+
+  const portableRoot = getPortableRoot();
+  if (app.isPackaged && portableRoot !== path.dirname(process.execPath)) {
+    const portableExecutable = path.join(portableRoot, path.basename(process.execPath));
+    if (fs.existsSync(portableExecutable)) {
+      return portableExecutable;
+    }
+  }
+
+  return process.execPath;
 }
 
 function getDataDir() {

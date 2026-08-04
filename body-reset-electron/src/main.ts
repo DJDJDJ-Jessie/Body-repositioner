@@ -3,6 +3,7 @@ import './style.css'
 import App from './App.vue'
 
 if (!window.bodyReset) {
+  window.bodyResetPreview = true
   const mockSettings = {
     focusMinutes: 50,
     resetMinutes: 6,

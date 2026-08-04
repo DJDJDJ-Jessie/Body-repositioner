@@ -11,6 +11,7 @@
 - `body-reset-electron/src/global.d.ts` 保存渲染进程 IPC 和数据结构类型。
 - `body-reset-electron/src/main.ts` 包含 UI 预览环境的 mock 数据和 mock IPC。
 - `便携版/` 是构建后的 Windows 免安装交付目录，不在 Git 中跟踪。用户数据、视频和统计文件都放在这里，不要把它们提交到仓库。
+- 正式使用入口必须是 `便携版/身体复位提醒器.exe`；`body-reset-electron/release/win-unpacked/` 只能作为构建暂存目录，浏览器/Vite 预览只能用于界面检查，不能被当成真实应用验证配置、视频或自动倒计时。
 - `手机产品/` 是独立的移动端原型，修改桌面版时不要顺手改变移动端，除非用户明确要求同步。
 
 ## 不可误解的产品意图

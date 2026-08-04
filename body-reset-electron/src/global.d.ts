@@ -2,6 +2,7 @@ export {}
 
 declare global {
   interface Window {
+    bodyResetPreview?: boolean
     bodyReset: {
       getState: () => Promise<AppState>
       saveSettings: (settings: AppSettings) => Promise<{ settings: AppSettings; state: AppState }>

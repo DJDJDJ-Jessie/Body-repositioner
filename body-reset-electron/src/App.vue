@@ -186,6 +186,7 @@ function createEmptyStatsTable(period: StatsPeriod = 'week'): StatsTable {
 const view = new URLSearchParams(window.location.search).get('view') || 'main'
 const isResetView = view === 'reset'
 const isReminderView = view === 'reminder'
+const isPreviewMode = Boolean(window.bodyResetPreview)
 
 const settings = ref<AppSettings>({ ...fallbackSettings })
 const remainingMs = ref(fallbackSettings.focusMinutes * 60_000)
@@ -203,6 +204,7 @@ const statsTable = ref<StatsTable>(createEmptyStatsTable('week'))
 const isSettingsOpen = ref(false)
 const toast = ref('')
 const lastReset = ref('')
+const stateLoadError = ref('')
 
 const resetPayload = ref<ResetPayload | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -410,9 +412,17 @@ function applyState(nextState: AppState) {
 }
 
 async function loadMainState() {
-  const nextState = await window.bodyReset.getState()
-  applyState(nextState)
-  await loadStatsTable(false)
+  let nextState: AppState
+  try {
+    nextState = await window.bodyReset.getState()
+    applyState(nextState)
+  } catch (error) {
+    console.error('Failed to load local app state:', error)
+    stateLoadError.value = '无法读取本地配置。请确认你打开的是便携版中的身体复位提醒器.exe。'
+    showToast('本地配置读取失败，当前没有启动倒计时')
+    return
+  }
+
   if (!autoStartChecked) {
     autoStartChecked = true
     if (nextState.shouldAutoStartTimer && !nextState.systemLocked) {
@@ -428,6 +438,13 @@ async function loadMainState() {
   mainStateLoaded = true
   if (!nextState.shouldAutoStartTimer) {
     maybeAutoStartWhenUnlocked()
+  }
+
+  try {
+    await loadStatsTable(false)
+  } catch (error) {
+    console.error('Failed to load stats table:', error)
+    stateLoadError.value = '统计文件暂时无法读取，但专注倒计时已经可以运行。'
   }
 }
 
@@ -1321,6 +1338,12 @@ onBeforeUnmount(() => {
 
 <template>
   <main v-if="!isResetView && !isReminderView" class="app-shell">
+    <div v-if="isPreviewMode" class="runtime-warning preview-warning">
+      当前是界面预览，不会读取本地配置、视频或自动倒计时。请双击“便携版/身体复位提醒器.exe”。
+    </div>
+    <div v-if="stateLoadError" class="runtime-warning error-warning">
+      {{ stateLoadError }}
+    </div>
     <section class="focus-surface" aria-label="专注计时">
       <div class="topbar">
         <div class="brand-block">

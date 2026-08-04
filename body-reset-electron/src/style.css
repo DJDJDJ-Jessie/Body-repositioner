@@ -93,6 +93,30 @@ input:focus-visible {
     #f7faf6;
 }
 
+.runtime-warning {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  z-index: 40;
+  width: min(720px, calc(100vw - 32px));
+  padding: 10px 16px;
+  border: 1px solid rgba(145, 91, 23, 0.28);
+  border-radius: 12px;
+  color: #5b3b12;
+  background: rgba(255, 247, 222, 0.96);
+  box-shadow: 0 12px 30px rgba(35, 54, 44, 0.12);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
+.error-warning {
+  border-color: rgba(153, 54, 48, 0.3);
+  color: #702b27;
+  background: rgba(255, 236, 234, 0.97);
+}
+
 .focus-surface {
   position: relative;
   width: min(100%, 1120px);
