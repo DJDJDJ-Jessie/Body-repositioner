@@ -348,6 +348,10 @@ p {
   background: linear-gradient(145deg, #378b76, #1f5144);
 }
 
+.primary-button:disabled {
+  opacity: 0.48;
+}
+
 .ghost-button,
 .secondary-button,
 .plain-button,
@@ -1184,6 +1188,25 @@ p {
   max-width: 360px;
   color: rgba(255, 255, 255, 0.72);
   line-height: 1.7;
+}
+
+.default-rest-message {
+  max-width: none !important;
+  color: #ffffff !important;
+  font-size: 28px;
+  font-weight: 760;
+}
+
+.default-rest-countdown {
+  margin-top: 22px;
+  color: #ffffff;
+  font-family:
+    'Cascadia Mono',
+    Consolas,
+    monospace;
+  font-size: 72px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 
 .reset-actions {

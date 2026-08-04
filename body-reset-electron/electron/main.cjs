@@ -91,6 +91,8 @@ let nextReminderAt = 0;
 let sleepReminderWindowKey = '';
 let sleepReminderEscalationLevel = 0;
 let activeSleepReminderIntervalMinutes = 0;
+let systemSuspended = false;
+let systemLockedState = false;
 const sleepReminderMaximumIntervalMinutes = 5;
 const sleepReminderFollowUpIntervalMinutes = 1;
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -390,7 +392,7 @@ function resolveActiveVideoSource(date = new Date()) {
     return {
       baseFolderPath,
       folderPath: dayFolder.path,
-      sourceLabel: `今日使用：${dayRule.label}文件夹`,
+      sourceLabel: `今日使用：${dayRule.label}文件夹 + 根目录共享视频`,
       sourceKind: 'day',
       matchedFolderName: dayFolder.name,
     };
@@ -406,7 +408,7 @@ function resolveActiveVideoSource(date = new Date()) {
     return {
       baseFolderPath,
       folderPath: groupFolder.path,
-      sourceLabel: `今日使用：${isWeekday ? '工作日' : '周末'}文件夹`,
+      sourceLabel: `今日使用：${isWeekday ? '工作日' : '周末'}文件夹 + 根目录共享视频`,
       sourceKind: isWeekday ? 'weekday' : 'weekend',
       matchedFolderName: groupFolder.name,
     };
@@ -432,16 +434,30 @@ function toPublicVideo(videoPath) {
   };
 }
 
-function scanVideos() {
-  const source = resolveActiveVideoSource();
-  const folderPath = source.folderPath;
+function scanDirectVideos(folderPath) {
   ensureDir(folderPath);
-
-  const videos = fs
+  return fs
     .readdirSync(folderPath, { withFileTypes: true })
     .filter((entry) => entry.isFile() && videoExtensions.has(path.extname(entry.name).toLowerCase()))
     .map((entry) => toPublicVideo(path.join(folderPath, entry.name)))
-    .filter((video) => video.size > 0)
+    .filter((video) => video.size > 0);
+}
+
+function scanVideos() {
+  const source = resolveActiveVideoSource();
+  const folderPaths = [source.baseFolderPath];
+  if (path.resolve(source.folderPath).toLowerCase() !== path.resolve(source.baseFolderPath).toLowerCase()) {
+    folderPaths.push(source.folderPath);
+  }
+
+  const videosByPath = new Map();
+  for (const folderPath of folderPaths) {
+    for (const video of scanDirectVideos(folderPath)) {
+      videosByPath.set(path.resolve(video.path).toLowerCase(), video);
+    }
+  }
+
+  const videos = [...videosByPath.values()]
     .sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
 
   return {
@@ -953,8 +969,36 @@ function getSleepReminderIntervalMinutes(settings = loadSettings()) {
   return Math.min(settings.sleepReminderInterval, sleepReminderMaximumIntervalMinutes);
 }
 
+function stopSleepReminderDuringInactiveState() {
+  resetSleepReminderEscalation();
+  nextReminderAt = 0;
+  if (pendingReminderPayload) {
+    pendingReminderPayload.canClose = true;
+  }
+
+  if (reminderWindow && !reminderWindow.isDestroyed()) {
+    reminderWindow.close();
+  } else {
+    pendingReminderPayload = null;
+  }
+}
+
+function restartSleepReminderAfterInactiveState() {
+  resetSleepReminderEscalation();
+  const settings = loadSettings();
+  nextReminderAt = settings.sleepReminderEnabled
+    ? Date.now() + getSleepReminderIntervalMinutes(settings) * 60_000
+    : 0;
+}
+
 function checkSleepReminderSchedule() {
   const settings = loadSettings();
+  const inactive = systemSuspended || systemLockedState || isSystemLocked();
+  if (inactive) {
+    stopSleepReminderDuringInactiveState();
+    return;
+  }
+
   const now = new Date();
   const windowKey = getSleepReminderWindowKey(now, settings);
   if (!settings.sleepReminderEnabled || !windowKey) {
@@ -966,7 +1010,6 @@ function checkSleepReminderSchedule() {
     sleepReminderEscalationLevel = 0;
     activeSleepReminderIntervalMinutes = 0;
   }
-  if (isSystemLocked()) return;
   if (resetWindow && !resetWindow.isDestroyed()) return;
   if (reminderWindow && !reminderWindow.isDestroyed()) return;
 
@@ -1487,11 +1530,17 @@ ipcMain.handle('reset:complete', (_event, payload = {}) => {
   const hasVideo = Boolean(resetPayload && resetPayload.video);
   const videoEnded = Boolean(payload.videoEnded);
   const elapsedMs = resetPayload?.startedAt ? Date.now() - resetPayload.startedAt : 0;
+  const resetSettings = resetPayload?.settings || loadSettings();
   const earlyResetAllowed =
-    Boolean(resetPayload?.settings.earlyResetEnabled) &&
-    elapsedMs >= resetPayload.settings.earlyResetMinutes * 60_000;
+    Boolean(resetSettings.earlyResetEnabled) &&
+    elapsedMs >= resetSettings.earlyResetMinutes * 60_000;
+  const defaultRestMinutes = resetSettings.earlyResetEnabled
+    ? Math.min(resetSettings.resetMinutes, resetSettings.earlyResetMinutes)
+    : resetSettings.resetMinutes;
+  const defaultRestAllowed =
+    !hasVideo && elapsedMs >= Math.max(1, defaultRestMinutes) * 60_000;
 
-  if (hasVideo && !videoEnded && !earlyResetAllowed) {
+  if ((hasVideo && !videoEnded && !earlyResetAllowed) || (!hasVideo && !defaultRestAllowed)) {
     return { completed: false, reason: 'not-ready' };
   }
 
@@ -1551,28 +1600,46 @@ app.whenReady().then(() => {
   if (startupSettings.externalLogSyncEnabled) {
     syncExternalLogs();
   }
+  systemLockedState = isSystemLocked();
   createMainWindow();
   startSleepReminderSchedule();
 
   powerMonitor.on('suspend', () => {
+    systemSuspended = true;
+    stopSleepReminderDuringInactiveState();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('system:suspend');
     }
   });
 
   powerMonitor.on('resume', () => {
+    systemSuspended = false;
+    systemLockedState = isSystemLocked();
+    if (systemLockedState) {
+      stopSleepReminderDuringInactiveState();
+    } else {
+      restartSleepReminderAfterInactiveState();
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('system:resume');
     }
   });
 
   powerMonitor.on('lock-screen', () => {
+    systemLockedState = true;
+    stopSleepReminderDuringInactiveState();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('system:lock');
     }
   });
 
   powerMonitor.on('unlock-screen', () => {
+    systemLockedState = false;
+    if (systemSuspended) {
+      stopSleepReminderDuringInactiveState();
+    } else {
+      restartSleepReminderAfterInactiveState();
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('system:unlock');
     }

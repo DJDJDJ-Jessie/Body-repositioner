@@ -207,15 +207,16 @@ const lastReset = ref('')
 const resetPayload = ref<ResetPayload | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
 const canCompleteReset = ref(false)
-const resetStage = ref<'loading' | 'playing' | 'manual-play' | 'ended' | 'empty' | 'fallback'>(
-  'loading',
-)
+const resetStage = ref<
+  'loading' | 'playing' | 'manual-play' | 'ended' | 'empty' | 'fallback' | 'text-rest'
+>('loading')
 const fallbackRemaining = ref(30)
 const emergencyHolding = ref(false)
 const emergencyLeft = ref(0)
 const resetVolume = ref(1)
 const resetIsPlaying = ref(false)
 const resetNotice = ref('身体先回来，工作等一下。')
+const defaultRestMessage = '喝口水，起来动感一下。'
 const earlyResetRemainingMs = ref(0)
 const reminderPayload = ref<ReminderPayload | null>(null)
 const reminderVideoRef = ref<HTMLVideoElement | null>(null)
@@ -287,6 +288,11 @@ const reminderVolumeText = computed(() => formatVolume(reminderVolume.value))
 const resetButtonText = computed(() => {
   if (resetStage.value === 'ended') return '完成，回到工作'
   if (resetStage.value === 'empty') return '我已知道'
+  if (resetStage.value === 'text-rest') {
+    return canCompleteReset.value
+      ? '默认休息完成，回到工作'
+      : `${formatTime(fallbackRemaining.value * 1000)} 后可返回`
+  }
   if (canCompleteReset.value && resetPayload.value?.settings.earlyResetEnabled) {
     return '提前完成，回到工作'
   }
@@ -859,6 +865,18 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, next))
 }
 
+function getDefaultRestDurationSeconds() {
+  const payload = resetPayload.value
+  if (!payload) return 60
+
+  const resetMinutes = Math.max(1, Number(payload.settings.resetMinutes) || 1)
+  const earlyResetMinutes = Math.max(1, Number(payload.settings.earlyResetMinutes) || 1)
+  const durationMinutes = payload.settings.earlyResetEnabled
+    ? Math.min(resetMinutes, earlyResetMinutes)
+    : resetMinutes
+  return Math.max(60, Math.round(durationMinutes * 60))
+}
+
 async function loadResetPayload() {
   resetMediaFailureHandled = false
   clearFallbackTimer()
@@ -869,9 +887,10 @@ async function loadResetPayload() {
   if (!resetPayload.value.video) {
     clearEarlyResetTimer()
     earlyResetRemainingMs.value = 0
-    resetStage.value = 'empty'
-    canCompleteReset.value = true
-    resetNotice.value = '还没有可播放的视频。'
+    resetStage.value = 'text-rest'
+    canCompleteReset.value = false
+    resetNotice.value = '没有可播放的视频，已切换为默认休息。'
+    startDefaultRestTimer()
     return
   }
 
@@ -1083,6 +1102,20 @@ function clearFallbackTimer() {
   }
 }
 
+function startDefaultRestTimer() {
+  clearFallbackTimer()
+  fallbackRemaining.value = getDefaultRestDurationSeconds()
+  canCompleteReset.value = false
+  fallbackHandle = window.setInterval(() => {
+    fallbackRemaining.value = Math.max(0, fallbackRemaining.value - 1)
+    if (fallbackRemaining.value <= 0) {
+      clearFallbackTimer()
+      canCompleteReset.value = true
+      resetNotice.value = '默认休息完成，可以回到工作。'
+    }
+  }, 1000)
+}
+
 function startFallback() {
   if (
     resetMediaFailureHandled ||
@@ -1115,7 +1148,10 @@ async function completeReset() {
   if (!canCompleteReset.value) return
   const result = await window.bodyReset.completeReset({
     videoName: resetPayload.value?.video?.name || '',
-    videoEnded: resetStage.value === 'ended' || resetStage.value === 'empty',
+    videoEnded:
+      resetStage.value === 'ended' ||
+      resetStage.value === 'empty' ||
+      resetStage.value === 'text-rest',
   })
   if (!result.completed && result.reason === 'not-ready') {
     updateEarlyResetAvailability()
@@ -1509,7 +1545,7 @@ onBeforeUnmount(() => {
 
             <div class="rule-card">
               <strong>按星期自动选视频</strong>
-              <span>在总文件夹里建“周一到周五”和“周末”，或建“周一”“周二”等每天专属文件夹。当天专属优先。</span>
+              <span>在总文件夹里建“周一到周五”和“周末”，或建“周一”“周二”等每天专属文件夹。当天专属优先，根目录视频会和当天文件夹一起播放。</span>
               <em>{{ baseVideoFolderPath || '正在准备总文件夹' }}</em>
             </div>
 
@@ -1688,19 +1724,26 @@ onBeforeUnmount(() => {
       @error="onVideoError"
     ></video>
 
-    <section v-if="resetStage === 'empty'" class="empty-reset">
+    <section v-if="resetStage === 'text-rest'" class="empty-reset text-rest-reset">
       <div class="empty-reset-inner">
         <ShieldCheck :size="30" />
-        <h1>还没有复位视频</h1>
-        <p>把 mp4、mov、wmv、avi、mkv 或 m4v 放进视频文件夹。</p>
+        <h1>没有复位视频，先做默认休息</h1>
+        <p class="default-rest-message">{{ defaultRestMessage }}</p>
+        <p>视频文件夹目前为空。请先离开电脑活动一下，默认休息结束后即可回到工作。</p>
+        <div class="default-rest-countdown">{{ formatTime(fallbackRemaining * 1000) }}</div>
         <div class="reset-actions">
           <button class="secondary-button light" type="button" @click="openVideoFolder">
             <FolderOpen :size="18" />
             <span>打开文件夹</span>
           </button>
-          <button class="primary-button light" type="button" @click="completeReset">
+          <button
+            class="primary-button light"
+            type="button"
+            :disabled="!canCompleteReset"
+            @click="completeReset"
+          >
             <Check :size="18" />
-            <span>返回工作</span>
+            <span>{{ resetButtonText }}</span>
           </button>
         </div>
       </div>
@@ -1717,7 +1760,7 @@ onBeforeUnmount(() => {
       <span>开始播放</span>
     </button>
 
-    <div v-if="resetStage !== 'empty'" class="reset-chrome">
+    <div v-if="resetStage !== 'empty' && resetStage !== 'text-rest'" class="reset-chrome">
       <div class="reset-copy">
         <p>{{ resetNotice }}</p>
         <strong v-if="resetVideoName">{{ resetVideoName }}</strong>

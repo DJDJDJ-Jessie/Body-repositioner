@@ -41,6 +41,8 @@ videos/
 data/
 ```
 
-Users only need to place reset videos in `videos/`. They can also create weekday folders such as `周一到周五`, `周末`, or day-specific folders such as `周一`, `周二`, etc. The app chooses day-specific folders first, then weekday/weekend folders, then the root `videos/` folder.
+Users only need to place reset videos in `videos/`. They can also create weekday folders such as `周一到周五`, `周末`, or day-specific folders such as `周一`, `周二`, etc. The app chooses day-specific folders first, then weekday/weekend folders; videos directly inside the root `videos/` folder are shared and added to the selected subfolder's playlist. If no matching subfolder exists, only the root folder is used.
+
+If the reset video library is empty, the app uses a built-in text rest flow (“喝口水，起来动感一下”) instead of allowing an immediate return. Sleep reminder windows are closed when Windows enters sleep or locks, and the reminder schedule starts a fresh interval after the computer becomes active again.
 
 Settings, playback state, and logs are managed by the app UI.
