@@ -3,6 +3,7 @@ import './style.css'
 import App from './App.vue'
 
 if (!window.bodyReset) {
+  window.bodyResetPreview = true
   const mockSettings = {
     focusMinutes: 50,
     resetMinutes: 6,
@@ -12,9 +13,13 @@ if (!window.bodyReset) {
     sleepReminderEnabled: false,
     sleepReminderStart: '23:00',
     sleepReminderEnd: '07:00',
-    sleepReminderInterval: 30,
+    sleepReminderInterval: 5,
     sleepReminderFolder: 'sleep-reminders',
     strictMode: true,
+    autoStartWhenUnlocked: true,
+    autoStartAfterSleep: true,
+    earlyResetEnabled: false,
+    earlyResetMinutes: 3,
     minimizeToTray: true,
     autoStart: false,
     emergencyExitSeconds: 5,
@@ -49,6 +54,7 @@ if (!window.bodyReset) {
       lastSyncedAt: null,
       lastError: null,
     },
+    systemLocked: false,
     shouldAutoStartTimer: false,
   }
   const getMockStatsTable = (period: 'week' | 'month') => ({
@@ -132,8 +138,12 @@ if (!window.bodyReset) {
     emergencyCloseReminder: async () => ({ closed: true, nextReminderAt: Date.now() + 300_000 }),
     setAutoStart: async () => mockSettings,
     onResetCompleted: () => () => undefined,
+    onSleepReminderStarted: () => () => undefined,
     onSystemSuspend: () => () => undefined,
     onSystemResume: () => () => undefined,
+    onSystemResumeFromSleep: () => () => undefined,
+    onSystemLock: () => () => undefined,
+    onSystemUnlock: () => () => undefined,
   }
 }
 

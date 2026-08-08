@@ -10,7 +10,7 @@ const {
   shell,
   Tray,
 } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -62,9 +62,13 @@ const defaultSettings = {
   sleepReminderEnabled: false,
   sleepReminderStart: '23:00',
   sleepReminderEnd: '07:00',
-  sleepReminderInterval: 30,
+  sleepReminderInterval: 5,
   sleepReminderFolder: 'sleep-reminders',
   strictMode: true,
+  autoStartWhenUnlocked: true,
+  autoStartAfterSleep: true,
+  earlyResetEnabled: false,
+  earlyResetMinutes: 3,
   minimizeToTray: true,
   autoStart: false,
   emergencyExitSeconds: 5,
@@ -79,20 +83,38 @@ let tray = null;
 let isQuitting = false;
 let pendingResetPayload = null;
 let pendingReminderPayload = null;
+let pendingResumeFromSleep = false;
 let settingsCache = null;
 let appIcon = null;
 let reminderTimer = null;
 let nextReminderAt = 0;
+let sleepReminderWindowKey = '';
+let sleepReminderEscalationLevel = 0;
+let activeSleepReminderIntervalMinutes = 0;
+let systemSuspended = false;
+let systemLockedState = false;
+const sleepReminderMaximumIntervalMinutes = 5;
+const sleepReminderFollowUpIntervalMinutes = 1;
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, commandLine) => {
+    const isResumeFromSleep = commandLine.includes('--resume-from-sleep');
+    if (isResumeFromSleep) {
+      pendingResumeFromSleep = true;
+    }
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
+    if (isResumeFromSleep) {
+      if (!mainWindow.webContents.isLoading()) {
+        mainWindow.webContents.send('system:resume-from-sleep');
+        pendingResumeFromSleep = false;
+      }
+    }
   });
 }
 
@@ -114,14 +136,33 @@ function getPortableRoot() {
   }
 
   if (app.isPackaged) {
-    return path.dirname(process.execPath);
+    const executableDir = path.dirname(process.execPath);
+    if (path.basename(executableDir).toLowerCase() === 'win-unpacked') {
+      const workspacePortableRoot = path.resolve(executableDir, '..', '..', '..', '便携版');
+      if (fs.existsSync(path.join(workspacePortableRoot, 'data', 'settings.json'))) {
+        return workspacePortableRoot;
+      }
+    }
+    return executableDir;
   }
 
   return path.resolve(__dirname, '..', '..');
 }
 
 function getLaunchExecutablePath() {
-  return process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  if (process.env.PORTABLE_EXECUTABLE_FILE) {
+    return process.env.PORTABLE_EXECUTABLE_FILE;
+  }
+
+  const portableRoot = getPortableRoot();
+  if (app.isPackaged && portableRoot !== path.dirname(process.execPath)) {
+    const portableExecutable = path.join(portableRoot, path.basename(process.execPath));
+    if (fs.existsSync(portableExecutable)) {
+      return portableExecutable;
+    }
+  }
+
+  return process.execPath;
 }
 
 function getDataDir() {
@@ -203,8 +244,8 @@ function normalizeSettings(input) {
     sleepReminderEnd: normalizeTimeValue(merged.sleepReminderEnd, defaultSettings.sleepReminderEnd),
     sleepReminderInterval: clampInt(
       merged.sleepReminderInterval,
-      5,
-      240,
+      1,
+      sleepReminderMaximumIntervalMinutes,
       defaultSettings.sleepReminderInterval,
     ),
     sleepReminderFolder:
@@ -212,6 +253,15 @@ function normalizeSettings(input) {
         ? merged.sleepReminderFolder.trim()
         : defaultSettings.sleepReminderFolder,
     strictMode: Boolean(merged.strictMode),
+    autoStartWhenUnlocked: Boolean(merged.autoStartWhenUnlocked),
+    autoStartAfterSleep: Boolean(merged.autoStartAfterSleep),
+    earlyResetEnabled: Boolean(merged.earlyResetEnabled),
+    earlyResetMinutes: clampInt(
+      merged.earlyResetMinutes,
+      1,
+      60,
+      defaultSettings.earlyResetMinutes,
+    ),
     minimizeToTray: Boolean(merged.minimizeToTray),
     autoStart: Boolean(merged.autoStart),
     emergencyExitSeconds: clampInt(
@@ -259,16 +309,33 @@ function loadSettings() {
 function saveSettings(nextSettings) {
   const previousSettings = settingsCache;
   settingsCache = normalizeSettings(nextSettings);
+  const reminderScheduleChanged = Boolean(
+    previousSettings &&
+      (previousSettings.sleepReminderStart !== settingsCache.sleepReminderStart ||
+        previousSettings.sleepReminderEnd !== settingsCache.sleepReminderEnd ||
+        previousSettings.sleepReminderInterval !== settingsCache.sleepReminderInterval),
+  );
   writeJson(getSettingsPath(), settingsCache);
   ensureDir(getVideoFolderPath(settingsCache));
   ensureDir(getSleepReminderFolderPath(settingsCache));
-  if (
-    settingsCache.sleepReminderEnabled &&
-    (!previousSettings || !previousSettings.sleepReminderEnabled)
+  if (!settingsCache.sleepReminderEnabled) {
+    resetSleepReminderEscalation();
+    nextReminderAt = 0;
+  } else if (
+    !previousSettings ||
+    !previousSettings.sleepReminderEnabled ||
+    reminderScheduleChanged
   ) {
+    resetSleepReminderEscalation();
     nextReminderAt = Date.now() + settingsCache.sleepReminderInterval * 60_000;
   }
   applyAutoStart(settingsCache.autoStart);
+  if (
+    !previousSettings ||
+    previousSettings.autoStartAfterSleep !== settingsCache.autoStartAfterSleep
+  ) {
+    applySleepResumeAutoStart(settingsCache.autoStartAfterSleep);
+  }
   if (settingsCache.externalLogSyncEnabled) {
     syncExternalLogs(settingsCache);
   } else {
@@ -344,7 +411,7 @@ function resolveActiveVideoSource(date = new Date()) {
     return {
       baseFolderPath,
       folderPath: dayFolder.path,
-      sourceLabel: `今日使用：${dayRule.label}文件夹`,
+      sourceLabel: `今日使用：${dayRule.label}文件夹 + 根目录共享视频`,
       sourceKind: 'day',
       matchedFolderName: dayFolder.name,
     };
@@ -360,7 +427,7 @@ function resolveActiveVideoSource(date = new Date()) {
     return {
       baseFolderPath,
       folderPath: groupFolder.path,
-      sourceLabel: `今日使用：${isWeekday ? '工作日' : '周末'}文件夹`,
+      sourceLabel: `今日使用：${isWeekday ? '工作日' : '周末'}文件夹 + 根目录共享视频`,
       sourceKind: isWeekday ? 'weekday' : 'weekend',
       matchedFolderName: groupFolder.name,
     };
@@ -386,21 +453,35 @@ function toPublicVideo(videoPath) {
   };
 }
 
-function scanVideos() {
-  const source = resolveActiveVideoSource();
-  const folderPath = source.folderPath;
+function scanDirectVideos(folderPath) {
   ensureDir(folderPath);
-
-  const videos = fs
+  return fs
     .readdirSync(folderPath, { withFileTypes: true })
     .filter((entry) => entry.isFile() && videoExtensions.has(path.extname(entry.name).toLowerCase()))
     .map((entry) => toPublicVideo(path.join(folderPath, entry.name)))
-    .filter((video) => video.size > 0)
+    .filter((video) => video.size > 0);
+}
+
+function scanVideos() {
+  const source = resolveActiveVideoSource();
+  const folderPaths = [source.baseFolderPath];
+  if (path.resolve(source.folderPath).toLowerCase() !== path.resolve(source.baseFolderPath).toLowerCase()) {
+    folderPaths.push(source.folderPath);
+  }
+
+  const videosByPath = new Map();
+  for (const folderPath of folderPaths) {
+    for (const video of scanDirectVideos(folderPath)) {
+      videosByPath.set(path.resolve(video.path).toLowerCase(), video);
+    }
+  }
+
+  const videos = [...videosByPath.values()]
     .sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
 
   return {
     baseFolderPath: source.baseFolderPath,
-    folderPath,
+    folderPath: source.folderPath,
     sourceLabel: source.sourceLabel,
     sourceKind: source.sourceKind,
     matchedFolderName: source.matchedFolderName,
@@ -424,6 +505,37 @@ function scanSleepReminderVideos() {
     count: videos.length,
     videos,
   };
+}
+
+function scanVideosForAppState(settings) {
+  try {
+    return scanVideos();
+  } catch (error) {
+    console.error('Failed to scan reset videos while building app state:', error);
+    const baseFolderPath = getVideoFolderPath(settings);
+    return {
+      baseFolderPath,
+      folderPath: baseFolderPath,
+      sourceLabel: '视频目录暂时无法读取',
+      sourceKind: 'unavailable',
+      matchedFolderName: null,
+      count: 0,
+      videos: [],
+    };
+  }
+}
+
+function scanSleepReminderVideosForAppState(settings) {
+  try {
+    return scanSleepReminderVideos();
+  } catch (error) {
+    console.error('Failed to scan sleep-reminder videos while building app state:', error);
+    return {
+      folderPath: getSleepReminderFolderPath(settings),
+      count: 0,
+      videos: [],
+    };
+  }
 }
 
 function readVideoState() {
@@ -847,11 +959,22 @@ function addResetSession(completed, durationMs) {
 
 function shouldAutoStartTimer() {
   const settings = loadSettings();
+  if (process.argv.includes('--resume-from-sleep')) {
+    return settings.autoStartAfterSleep;
+  }
   if (!settings.autoStart) return false;
   if (process.argv.includes('--auto-start-timer')) return true;
 
   try {
     return Boolean(app.getLoginItemSettings().wasOpenedAtLogin);
+  } catch {
+    return false;
+  }
+}
+
+function isSystemLocked() {
+  try {
+    return powerMonitor.getSystemIdleState(0) === 'locked';
   } catch {
     return false;
   }
@@ -864,28 +987,92 @@ function timeToMinutes(value) {
 }
 
 function isWithinSleepReminderWindow(date = new Date()) {
-  const settings = loadSettings();
+  return Boolean(getSleepReminderWindowKey(date));
+}
+
+function getSleepReminderWindowKey(date = new Date(), settings = loadSettings()) {
   const start = timeToMinutes(settings.sleepReminderStart);
   const end = timeToMinutes(settings.sleepReminderEnd);
-  if (start === null || end === null || start === end) return false;
+  if (start === null || end === null || start === end) return '';
 
   const current = date.getHours() * 60 + date.getMinutes();
-  return start < end ? current >= start && current < end : current >= start || current < end;
+  const insideWindow = start < end
+    ? current >= start && current < end
+    : current >= start || current < end;
+  if (!insideWindow) return '';
+
+  const windowDate = start > end && current < end ? addLocalDays(date, -1) : date;
+  return `${getLocalDateKey(windowDate)}:${start}-${end}`;
+}
+
+function resetSleepReminderEscalation() {
+  sleepReminderWindowKey = '';
+  sleepReminderEscalationLevel = 0;
+  activeSleepReminderIntervalMinutes = 0;
+}
+
+function getSleepReminderIntervalMinutes(settings = loadSettings()) {
+  if (sleepReminderEscalationLevel > 0) {
+    return sleepReminderFollowUpIntervalMinutes;
+  }
+
+  return Math.min(settings.sleepReminderInterval, sleepReminderMaximumIntervalMinutes);
+}
+
+function stopSleepReminderDuringInactiveState() {
+  resetSleepReminderEscalation();
+  nextReminderAt = 0;
+  if (pendingReminderPayload) {
+    pendingReminderPayload.canClose = true;
+  }
+
+  if (reminderWindow && !reminderWindow.isDestroyed()) {
+    reminderWindow.close();
+  } else {
+    pendingReminderPayload = null;
+  }
+}
+
+function restartSleepReminderAfterInactiveState() {
+  resetSleepReminderEscalation();
+  const settings = loadSettings();
+  nextReminderAt = settings.sleepReminderEnabled
+    ? Date.now() + getSleepReminderIntervalMinutes(settings) * 60_000
+    : 0;
 }
 
 function checkSleepReminderSchedule() {
   const settings = loadSettings();
-  if (!settings.sleepReminderEnabled || !isWithinSleepReminderWindow()) return;
+  const inactive = systemSuspended || systemLockedState || isSystemLocked();
+  if (inactive) {
+    stopSleepReminderDuringInactiveState();
+    return;
+  }
+
+  const now = new Date();
+  const windowKey = getSleepReminderWindowKey(now, settings);
+  if (!settings.sleepReminderEnabled || !windowKey) {
+    resetSleepReminderEscalation();
+    return;
+  }
+  if (sleepReminderWindowKey !== windowKey) {
+    sleepReminderWindowKey = windowKey;
+    sleepReminderEscalationLevel = 0;
+    activeSleepReminderIntervalMinutes = 0;
+  }
   if (resetWindow && !resetWindow.isDestroyed()) return;
   if (reminderWindow && !reminderWindow.isDestroyed()) return;
 
-  const intervalMs = settings.sleepReminderInterval * 60_000;
   if (Date.now() < nextReminderAt) return;
 
   const video = pickNextSleepReminderVideo();
   if (!video) return;
 
-  nextReminderAt = Date.now() + intervalMs;
+  const intervalMinutes = getSleepReminderIntervalMinutes(settings);
+  sleepReminderEscalationLevel += 1;
+  activeSleepReminderIntervalMinutes = intervalMinutes;
+  const nextIntervalMinutes = getSleepReminderIntervalMinutes(settings);
+  nextReminderAt = Date.now() + intervalMinutes * 60_000;
   pendingReminderPayload = {
     id: Date.now(),
     startedAt: Date.now(),
@@ -893,11 +1080,18 @@ function checkSleepReminderSchedule() {
     settings,
     canClose: false,
   };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('sleep-reminder:started', {
+      intervalMinutes,
+      nextIntervalMinutes,
+    });
+  }
   createReminderWindow();
 }
 
 function startSleepReminderSchedule() {
   if (reminderTimer) clearInterval(reminderTimer);
+  resetSleepReminderEscalation();
   const settings = loadSettings();
   nextReminderAt = Date.now() + settings.sleepReminderInterval * 60_000;
   reminderTimer = setInterval(checkSleepReminderSchedule, 15_000);
@@ -907,21 +1101,54 @@ function pauseActiveMedia() {
   if (process.platform !== 'win32') return;
 
   const script = `
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class BodyResetMediaKeys {
-  [DllImport("user32.dll")]
-  public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+$ErrorActionPreference = 'Stop'
+
+function Wait-WinRtResult {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object]$Operation,
+    [Parameter(Mandatory = $true)]
+    [Type]$ResultType
+  )
+
+  $asTaskMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+    Where-Object {
+      $_.Name -eq 'AsTask' -and
+      $_.IsGenericMethodDefinition -and
+      $_.GetGenericArguments().Count -eq 1 -and
+      $_.GetParameters().Count -eq 1
+    } |
+    Select-Object -First 1
+
+  if ($null -eq $asTaskMethod) {
+    throw 'Windows Runtime task bridge is unavailable'
+  }
+
+  $task = $asTaskMethod.MakeGenericMethod($ResultType).Invoke($null, @($Operation))
+  return $task.GetAwaiter().GetResult()
 }
-'@
-[BodyResetMediaKeys]::keybd_event(0xB3, 0, 0, [UIntPtr]::Zero)
-[BodyResetMediaKeys]::keybd_event(0xB3, 0, 2, [UIntPtr]::Zero)
+
+try {
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+  $managerType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime]
+  $manager = Wait-WinRtResult -Operation $managerType::RequestAsync() -ResultType $managerType
+  $session = $manager.GetCurrentSession()
+  if ($null -eq $session) { exit 0 }
+
+  $playbackInfo = $session.GetPlaybackInfo()
+  $playingStatus = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus]::Playing
+  if ($playbackInfo.PlaybackStatus -ne $playingStatus) { exit 0 }
+
+  Wait-WinRtResult -Operation $session.TryPauseAsync() -ResultType ([System.Boolean]) | Out-Null
+} catch {
+  # If the media session API is unavailable, do nothing rather than sending a toggle key.
+}
 `;
 
+  const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
   const child = spawn(
     'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script],
+    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encodedScript],
     { windowsHide: true, stdio: 'ignore' },
   );
   child.unref();
@@ -929,8 +1156,8 @@ public static class BodyResetMediaKeys {
 
 function buildAppState() {
   const settings = loadSettings();
-  const library = scanVideos();
-  const reminderLibrary = scanSleepReminderVideos();
+  const library = scanVideosForAppState(settings);
+  const reminderLibrary = scanSleepReminderVideosForAppState(settings);
   return {
     appRoot: getPortableRoot(),
     dataDir: getDataDir(),
@@ -946,6 +1173,7 @@ function buildAppState() {
     sleepReminderVideoCount: reminderLibrary.count,
     todayStats: getTodayStats(),
     externalLogSyncStatus: getExternalLogSyncStatus(settings),
+    systemLocked: isSystemLocked(),
     shouldAutoStartTimer: shouldAutoStartTimer(),
   };
 }
@@ -979,6 +1207,10 @@ function createMainWindow() {
   mainWindow.once('ready-to-show', () => {
     if (!mainWindow.isVisible()) {
       mainWindow.show();
+    }
+    if (pendingResumeFromSleep && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:resume-from-sleep');
+      pendingResumeFromSleep = false;
     }
   });
 
@@ -1156,6 +1388,57 @@ function applyAutoStart(enabled) {
   });
 }
 
+const sleepResumeTaskName = 'Body Reset Reminder - Resume from sleep';
+const sleepResumeEventQuery =
+  '*[System[Provider[@Name="Microsoft-Windows-Power-Troubleshooter"] and EventID=1]]';
+
+function applySleepResumeAutoStart(enabled) {
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+
+  if (!enabled) {
+    spawnSync('schtasks.exe', ['/Delete', '/TN', sleepResumeTaskName, '/F'], {
+      windowsHide: true,
+      encoding: 'utf8',
+      stdio: 'ignore',
+    });
+    return;
+  }
+
+  const executablePath = getLaunchExecutablePath().replace(/"/g, '""');
+  const taskRun = `"${executablePath}" --resume-from-sleep`;
+  const result = spawnSync(
+    'schtasks.exe',
+    [
+      '/Create',
+      '/SC',
+      'ONEVENT',
+      '/EC',
+      'System',
+      '/MO',
+      sleepResumeEventQuery,
+      '/TN',
+      sleepResumeTaskName,
+      '/TR',
+      taskRun,
+      '/IT',
+      '/RL',
+      'LIMITED',
+      '/DELAY',
+      '0000:05',
+      '/F',
+    ],
+    {
+      windowsHide: true,
+      encoding: 'utf8',
+    },
+  );
+
+  if (result.error || result.status !== 0) {
+    const details = result.error?.message || result.stderr || result.stdout || 'unknown error';
+    console.error('Failed to register sleep-resume task:', details);
+  }
+}
+
 ipcMain.handle('app:get-state', () => buildAppState());
 
 ipcMain.handle('stats:add-focus-time', (_event, ms) => addFocusTime(ms));
@@ -1265,7 +1548,12 @@ ipcMain.handle('reminder:emergency-close', () => {
     pendingReminderPayload.canClose = true;
   }
 
-  nextReminderAt = Date.now() + 5 * 60_000;
+  const settings = loadSettings();
+  const intervalMinutes = getSleepReminderIntervalMinutes(settings);
+  activeSleepReminderIntervalMinutes = intervalMinutes;
+  nextReminderAt = settings.sleepReminderEnabled
+    ? Date.now() + intervalMinutes * 60_000
+    : 0;
   if (reminderWindow && !reminderWindow.isDestroyed()) {
     reminderWindow.close();
   } else {
@@ -1288,6 +1576,24 @@ ipcMain.handle('reset:get-payload', () => {
 });
 
 ipcMain.handle('reset:complete', (_event, payload = {}) => {
+  const resetPayload = pendingResetPayload;
+  const hasVideo = Boolean(resetPayload && resetPayload.video);
+  const videoEnded = Boolean(payload.videoEnded);
+  const elapsedMs = resetPayload?.startedAt ? Date.now() - resetPayload.startedAt : 0;
+  const resetSettings = resetPayload?.settings || loadSettings();
+  const earlyResetAllowed =
+    Boolean(resetSettings.earlyResetEnabled) &&
+    elapsedMs >= resetSettings.earlyResetMinutes * 60_000;
+  const defaultRestMinutes = resetSettings.earlyResetEnabled
+    ? Math.min(resetSettings.resetMinutes, resetSettings.earlyResetMinutes)
+    : resetSettings.resetMinutes;
+  const defaultRestAllowed =
+    !hasVideo && elapsedMs >= Math.max(1, defaultRestMinutes) * 60_000;
+
+  if ((hasVideo && !videoEnded && !earlyResetAllowed) || (!hasVideo && !defaultRestAllowed)) {
+    return { completed: false, reason: 'not-ready' };
+  }
+
   if (pendingResetPayload) {
     pendingResetPayload.canClose = true;
   }
@@ -1339,22 +1645,68 @@ app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   const startupSettings = loadSettings();
   ensurePortableDirs();
+  if (process.argv.includes('--smoke-test-state')) {
+    try {
+      const state = buildAppState();
+      const resetLibrary = scanVideos();
+      const sleepReminderLibrary = scanSleepReminderVideos();
+      if (!state.settings || !state.dataDir || resetLibrary.count < 0 || sleepReminderLibrary.count < 0) {
+        throw new Error('App state smoke test returned an incomplete result');
+      }
+      app.exit(0);
+    } catch (error) {
+      console.error('App state smoke test failed:', error);
+      app.exit(1);
+    }
+    return;
+  }
   applyAutoStart(startupSettings.autoStart);
+  applySleepResumeAutoStart(startupSettings.autoStartAfterSleep);
   if (startupSettings.externalLogSyncEnabled) {
     syncExternalLogs();
   }
+  systemLockedState = isSystemLocked();
   createMainWindow();
   startSleepReminderSchedule();
 
   powerMonitor.on('suspend', () => {
+    systemSuspended = true;
+    stopSleepReminderDuringInactiveState();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('system:suspend');
     }
   });
 
   powerMonitor.on('resume', () => {
+    systemSuspended = false;
+    systemLockedState = isSystemLocked();
+    if (systemLockedState) {
+      stopSleepReminderDuringInactiveState();
+    } else {
+      restartSleepReminderAfterInactiveState();
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('system:resume');
+    }
+  });
+
+  powerMonitor.on('lock-screen', () => {
+    systemLockedState = true;
+    stopSleepReminderDuringInactiveState();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:lock');
+    }
+  });
+
+  powerMonitor.on('unlock-screen', () => {
+    systemLockedState = false;
+    if (systemSuspended) {
+      stopSleepReminderDuringInactiveState();
+    } else {
+      restartSleepReminderAfterInactiveState();
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:unlock');
     }
   });
 

@@ -28,6 +28,10 @@ type AppSettings = {
   sleepReminderInterval: number
   sleepReminderFolder: string
   strictMode: boolean
+  autoStartWhenUnlocked: boolean
+  autoStartAfterSleep: boolean
+  earlyResetEnabled: boolean
+  earlyResetMinutes: number
   minimizeToTray: boolean
   autoStart: boolean
   emergencyExitSeconds: number
@@ -100,6 +104,7 @@ type AppState = {
   sleepReminderVideoCount: number
   todayStats: TodayStats
   externalLogSyncStatus: ExternalLogSyncStatus
+  systemLocked: boolean
   shouldAutoStartTimer: boolean
 }
 
@@ -128,9 +133,13 @@ const fallbackSettings: AppSettings = {
   sleepReminderEnabled: false,
   sleepReminderStart: '23:00',
   sleepReminderEnd: '07:00',
-  sleepReminderInterval: 30,
+  sleepReminderInterval: 5,
   sleepReminderFolder: 'sleep-reminders',
   strictMode: true,
+  autoStartWhenUnlocked: true,
+  autoStartAfterSleep: true,
+  earlyResetEnabled: false,
+  earlyResetMinutes: 3,
   minimizeToTray: true,
   autoStart: false,
   emergencyExitSeconds: 5,
@@ -177,6 +186,7 @@ function createEmptyStatsTable(period: StatsPeriod = 'week'): StatsTable {
 const view = new URLSearchParams(window.location.search).get('view') || 'main'
 const isResetView = view === 'reset'
 const isReminderView = view === 'reminder'
+const isPreviewMode = Boolean(window.bodyResetPreview)
 
 const settings = ref<AppSettings>({ ...fallbackSettings })
 const remainingMs = ref(fallbackSettings.focusMinutes * 60_000)
@@ -194,19 +204,22 @@ const statsTable = ref<StatsTable>(createEmptyStatsTable('week'))
 const isSettingsOpen = ref(false)
 const toast = ref('')
 const lastReset = ref('')
+const stateLoadError = ref('')
 
 const resetPayload = ref<ResetPayload | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
 const canCompleteReset = ref(false)
-const resetStage = ref<'loading' | 'playing' | 'manual-play' | 'ended' | 'empty' | 'fallback'>(
-  'loading',
-)
+const resetStage = ref<
+  'loading' | 'playing' | 'manual-play' | 'ended' | 'empty' | 'fallback' | 'text-rest'
+>('loading')
 const fallbackRemaining = ref(30)
 const emergencyHolding = ref(false)
 const emergencyLeft = ref(0)
 const resetVolume = ref(1)
 const resetIsPlaying = ref(false)
 const resetNotice = ref('身体先回来，工作等一下。')
+const defaultRestMessage = '喝口水，起来动感一下。'
+const earlyResetRemainingMs = ref(0)
 const reminderPayload = ref<ReminderPayload | null>(null)
 const reminderVideoRef = ref<HTMLVideoElement | null>(null)
 const reminderVolume = ref(1)
@@ -221,8 +234,12 @@ let fallbackHandle: number | null = null
 let emergencyHandle: number | null = null
 let reminderEmergencyHandle: number | null = null
 let removeResetListener: (() => void) | null = null
+let removeSleepReminderListener: (() => void) | null = null
 let removeSuspendListener: (() => void) | null = null
 let removeResumeListener: (() => void) | null = null
+let removeResumeFromSleepListener: (() => void) | null = null
+let removeLockListener: (() => void) | null = null
+let removeUnlockListener: (() => void) | null = null
 let mediaVolumeSaveHandle: number | null = null
 let pendingMediaVolumeSave: {
   key: 'resetVolume' | 'sleepReminderVolume'
@@ -233,7 +250,15 @@ let focusBufferMs = 0
 let isFlushingFocus = false
 let autoStartChecked = false
 let wasRunningBeforeSuspend = false
-
+let wasRunningBeforeLock = false
+let autoStartAfterResumePending = false
+let isSystemLocked = false
+let mainStateLoaded = false
+let autoResumeHandle: number | null = null
+let earlyResetHandle: number | null = null
+let resetMediaFailureHandled = false
+let sleepReminderPauseActive = false
+const autoResumeAfterPauseMs = 5 * 60_000
 const totalFocusMs = computed(() => settings.value.focusMinutes * 60_000)
 const elapsedMs = computed(() => Math.max(0, totalFocusMs.value - remainingMs.value))
 const focusPercent = computed(() => {
@@ -265,6 +290,17 @@ const reminderVolumeText = computed(() => formatVolume(reminderVolume.value))
 const resetButtonText = computed(() => {
   if (resetStage.value === 'ended') return '完成，回到工作'
   if (resetStage.value === 'empty') return '我已知道'
+  if (resetStage.value === 'text-rest') {
+    return canCompleteReset.value
+      ? '默认休息完成，回到工作'
+      : `${formatTime(fallbackRemaining.value * 1000)} 后可返回`
+  }
+  if (canCompleteReset.value && resetPayload.value?.settings.earlyResetEnabled) {
+    return '提前完成，回到工作'
+  }
+  if (resetPayload.value?.settings.earlyResetEnabled && earlyResetRemainingMs.value > 0) {
+    return `${formatTime(earlyResetRemainingMs.value)} 后可返回`
+  }
   return '视频结束后可完成'
 })
 const todayFocusText = computed(() => formatDuration(todayStats.value.focusMs))
@@ -369,23 +405,46 @@ function applyState(nextState: AppState) {
     ...fallbackExternalLogSyncStatus,
     ...nextState.externalLogSyncStatus,
   }
+  isSystemLocked = Boolean(nextState.systemLocked)
   if (timerMode.value === 'idle') {
     remainingMs.value = settings.value.focusMinutes * 60_000
   }
 }
 
 async function loadMainState() {
-  const nextState = await window.bodyReset.getState()
-  applyState(nextState)
-  await loadStatsTable(false)
+  let nextState: AppState
+  try {
+    nextState = await window.bodyReset.getState()
+    applyState(nextState)
+  } catch (error) {
+    console.error('Failed to load local app state:', error)
+    stateLoadError.value = '程序读取本地数据失败。你的配置文件没有被覆盖，请退出软件后重新打开。'
+    showToast('本地配置读取失败，当前没有启动倒计时')
+    return
+  }
+
   if (!autoStartChecked) {
     autoStartChecked = true
-    if (nextState.shouldAutoStartTimer) {
+    if (nextState.shouldAutoStartTimer && !nextState.systemLocked) {
       remainingMs.value = totalFocusMs.value
       timerMode.value = 'running'
       startTicker()
       showToast('已随开机启动开始倒计时')
     }
+  }
+  if (nextState.shouldAutoStartTimer && nextState.systemLocked) {
+    autoStartAfterResumePending = true
+  }
+  mainStateLoaded = true
+  if (!nextState.shouldAutoStartTimer) {
+    maybeAutoStartWhenUnlocked()
+  }
+
+  try {
+    await loadStatsTable(false)
+  } catch (error) {
+    console.error('Failed to load stats table:', error)
+    stateLoadError.value = '统计文件暂时无法读取，但专注倒计时已经可以运行。'
   }
 }
 
@@ -414,6 +473,68 @@ function clearTicker() {
   if (tickHandle) {
     window.clearInterval(tickHandle)
     tickHandle = null
+  }
+}
+
+function clearAutoResume() {
+  if (autoResumeHandle) {
+    window.clearTimeout(autoResumeHandle)
+    autoResumeHandle = null
+  }
+}
+
+function startFocusTimer(message = '') {
+  if (isSystemLocked || timerMode.value === 'waiting' || timerMode.value === 'running') return
+  sleepReminderPauseActive = false
+  autoStartAfterResumePending = false
+  clearAutoResume()
+  if (remainingMs.value <= 0) {
+    remainingMs.value = totalFocusMs.value
+  }
+  timerMode.value = 'running'
+  startTicker()
+  if (message) showToast(message)
+}
+
+function scheduleAutoResume() {
+  clearAutoResume()
+  if (
+    !mainStateLoaded ||
+    !settings.value.autoStartWhenUnlocked ||
+    isSystemLocked ||
+    sleepReminderPauseActive ||
+    timerMode.value !== 'paused'
+  ) {
+    return
+  }
+
+  autoResumeHandle = window.setTimeout(() => {
+    autoResumeHandle = null
+    if (
+      settings.value.autoStartWhenUnlocked &&
+      !isSystemLocked &&
+      timerMode.value === 'paused'
+    ) {
+      startFocusTimer('暂停已超过 5 分钟，倒计时已自动恢复')
+    }
+  }, autoResumeAfterPauseMs)
+}
+
+function maybeAutoStartWhenUnlocked() {
+  if (
+    !mainStateLoaded ||
+    !settings.value.autoStartWhenUnlocked ||
+    isSystemLocked ||
+    sleepReminderPauseActive
+  ) {
+    return
+  }
+  if (timerMode.value === 'paused') {
+    scheduleAutoResume()
+    return
+  }
+  if (timerMode.value === 'idle') {
+    startFocusTimer('电脑处于解锁状态，已自动开始专注倒计时')
   }
 }
 
@@ -465,17 +586,24 @@ function runPrimaryAction() {
     timerMode.value = 'paused'
     clearTicker()
     void flushFocusStats()
+    scheduleAutoResume()
     return
   }
 
   if (remainingMs.value <= 0) {
     remainingMs.value = totalFocusMs.value
   }
+  sleepReminderPauseActive = false
+  autoStartAfterResumePending = false
+  clearAutoResume()
   timerMode.value = 'running'
   startTicker()
 }
 
 function resetTimer() {
+  sleepReminderPauseActive = false
+  autoStartAfterResumePending = false
+  clearAutoResume()
   clearTicker()
   void flushFocusStats()
   timerMode.value = 'idle'
@@ -489,8 +617,29 @@ async function beginReset() {
   await window.bodyReset.beginReset()
 }
 
+function handleSleepReminderStarted(payload?: {
+  intervalMinutes?: number
+  nextIntervalMinutes?: number
+}) {
+  if (isResetView || isReminderView) return
+  sleepReminderPauseActive = true
+  autoStartAfterResumePending = false
+  clearAutoResume()
+  if (timerMode.value !== 'running') return
+
+  timerMode.value = 'paused'
+  clearTicker()
+  void flushFocusStats()
+  const intervalText = payload?.nextIntervalMinutes
+    ? `，下次间隔将为 ${payload.nextIntervalMinutes} 分钟`
+    : ''
+  showToast(`睡眠提醒已开始，专注倒计时已暂停${intervalText}`)
+}
+
 function handleSystemSuspend() {
   if (isResetView || isReminderView) return
+  clearAutoResume()
+  autoStartAfterResumePending = false
   wasRunningBeforeSuspend = timerMode.value === 'running'
   if (!wasRunningBeforeSuspend) return
 
@@ -500,12 +649,104 @@ function handleSystemSuspend() {
   showToast('电脑进入睡眠，倒计时已自动暂停')
 }
 
+function handleSystemResumeFromSleep() {
+  if (isResetView || isReminderView || !settings.value.autoStartAfterSleep) return
+  if (sleepReminderPauseActive) return
+  autoStartAfterResumePending = false
+  if (isSystemLocked) {
+    autoStartAfterResumePending = timerMode.value !== 'running' && timerMode.value !== 'waiting'
+    return
+  }
+  if (timerMode.value === 'running' || timerMode.value === 'waiting') return
+
+  clearAutoResume()
+  startFocusTimer('电脑从睡眠恢复，已自动开启专注倒计时')
+}
+
 function handleSystemResume() {
-  if (isResetView || isReminderView || !wasRunningBeforeSuspend) return
+  if (isResetView || isReminderView) return
+  const shouldResume = wasRunningBeforeSuspend
   wasRunningBeforeSuspend = false
-  timerMode.value = 'running'
-  startTicker()
-  showToast('电脑已唤醒，倒计时已自动继续')
+  if (sleepReminderPauseActive) {
+    wasRunningBeforeLock = false
+    autoStartAfterResumePending = false
+    clearAutoResume()
+    return
+  }
+  if (shouldResume && isSystemLocked) {
+    wasRunningBeforeLock = true
+    return
+  }
+  if (isSystemLocked) {
+    autoStartAfterResumePending =
+      settings.value.autoStartAfterSleep &&
+      timerMode.value !== 'running' &&
+      timerMode.value !== 'waiting'
+    return
+  }
+  if (shouldResume) {
+    timerMode.value = 'running'
+    startTicker()
+    showToast('电脑已唤醒，倒计时已自动继续')
+    return
+  }
+
+  if (
+    settings.value.autoStartAfterSleep &&
+    !isSystemLocked &&
+    timerMode.value !== 'running' &&
+    timerMode.value !== 'waiting'
+  ) {
+    clearAutoResume()
+    startFocusTimer('电脑从睡眠恢复，已检查并自动开启专注倒计时')
+    return
+  }
+
+  maybeAutoStartWhenUnlocked()
+}
+
+function handleSystemLock() {
+  if (isResetView || isReminderView || isSystemLocked) return
+  isSystemLocked = true
+  autoStartAfterResumePending = false
+  clearAutoResume()
+  wasRunningBeforeLock = timerMode.value === 'running'
+  if (!wasRunningBeforeLock) return
+
+  timerMode.value = 'paused'
+  clearTicker()
+  void flushFocusStats()
+}
+
+function handleSystemUnlock() {
+  if (isResetView || isReminderView) return
+  isSystemLocked = false
+  if (sleepReminderPauseActive) {
+    autoStartAfterResumePending = false
+    return
+  }
+  if (wasRunningBeforeLock) {
+    wasRunningBeforeLock = false
+    timerMode.value = 'running'
+    startTicker()
+    showToast('电脑已解锁，倒计时已自动继续')
+    return
+  }
+
+  if (autoStartAfterResumePending) {
+    autoStartAfterResumePending = false
+    if (
+      settings.value.autoStartAfterSleep &&
+      timerMode.value !== 'running' &&
+      timerMode.value !== 'waiting'
+    ) {
+      clearAutoResume()
+      startFocusTimer('电脑从睡眠恢复并解锁，已自动开启专注倒计时')
+      return
+    }
+  }
+
+  maybeAutoStartWhenUnlocked()
 }
 
 async function saveSettings() {
@@ -621,13 +862,18 @@ function onResetMinutesChange() {
   saveSettings()
 }
 
+function onEarlyResetMinutesChange() {
+  settings.value.earlyResetMinutes = clamp(settings.value.earlyResetMinutes, 1, 60)
+  void saveSettings()
+}
+
 function onEmergencySecondsChange() {
   settings.value.emergencyExitSeconds = clamp(settings.value.emergencyExitSeconds, 3, 20)
   saveSettings()
 }
 
 function onSleepReminderIntervalChange() {
-  settings.value.sleepReminderInterval = clamp(settings.value.sleepReminderInterval, 5, 240)
+  settings.value.sleepReminderInterval = clamp(settings.value.sleepReminderInterval, 1, 5)
   void saveSettings()
 }
 
@@ -636,20 +882,38 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, next))
 }
 
+function getDefaultRestDurationSeconds() {
+  const payload = resetPayload.value
+  if (!payload) return 60
+
+  const resetMinutes = Math.max(1, Number(payload.settings.resetMinutes) || 1)
+  const earlyResetMinutes = Math.max(1, Number(payload.settings.earlyResetMinutes) || 1)
+  const durationMinutes = payload.settings.earlyResetEnabled
+    ? Math.min(resetMinutes, earlyResetMinutes)
+    : resetMinutes
+  return Math.max(60, Math.round(durationMinutes * 60))
+}
+
 async function loadResetPayload() {
+  resetMediaFailureHandled = false
+  clearFallbackTimer()
   resetPayload.value = await window.bodyReset.getResetPayload()
   resetVolume.value = clampVolume(resetPayload.value.settings.resetVolume)
   emergencyLeft.value = resetPayload.value.settings.emergencyExitSeconds
 
   if (!resetPayload.value.video) {
-    resetStage.value = 'empty'
-    canCompleteReset.value = true
-    resetNotice.value = '还没有可播放的视频。'
+    clearEarlyResetTimer()
+    earlyResetRemainingMs.value = 0
+    resetStage.value = 'text-rest'
+    canCompleteReset.value = false
+    resetNotice.value = '没有可播放的视频，已切换为默认休息。'
+    startDefaultRestTimer()
     return
   }
 
   resetStage.value = 'playing'
   canCompleteReset.value = false
+  startEarlyResetTimer()
   await nextTick()
   const video = videoRef.value
   if (!video) return
@@ -662,6 +926,49 @@ async function loadResetPayload() {
   } catch {
     resetStage.value = 'manual-play'
     resetNotice.value = '点击画面开始播放。'
+  }
+}
+
+function resetStartedAt() {
+  return resetPayload.value?.startedAt || Date.now()
+}
+
+function updateEarlyResetAvailability() {
+  const payload = resetPayload.value
+  if (!payload?.video || !payload.settings.earlyResetEnabled) {
+    earlyResetRemainingMs.value = 0
+    return
+  }
+
+  const minimumMs = payload.settings.earlyResetMinutes * 60_000
+  const elapsedMs = Math.max(0, Date.now() - resetStartedAt())
+  earlyResetRemainingMs.value = Math.max(0, minimumMs - elapsedMs)
+  if (earlyResetRemainingMs.value <= 0) {
+    canCompleteReset.value = true
+    if (resetStage.value !== 'ended') {
+      resetNotice.value = '已达到最短复位时间，可以提前回到工作。'
+    }
+    clearEarlyResetTimer()
+  }
+}
+
+function startEarlyResetTimer() {
+  clearEarlyResetTimer()
+  updateEarlyResetAvailability()
+  if (
+    !resetPayload.value?.video ||
+    !resetPayload.value.settings.earlyResetEnabled ||
+    earlyResetRemainingMs.value <= 0
+  ) {
+    return
+  }
+  earlyResetHandle = window.setInterval(updateEarlyResetAvailability, 250)
+}
+
+function clearEarlyResetTimer() {
+  if (earlyResetHandle) {
+    window.clearInterval(earlyResetHandle)
+    earlyResetHandle = null
   }
 }
 
@@ -693,11 +1000,19 @@ function toggleResetVideo() {
   resetNotice.value = '视频已暂停，准备好后继续播放。'
 }
 
-function onVideoEnded() {
+function finalizeResetPlayback() {
+  clearEarlyResetTimer()
+  clearFallbackTimer()
+  earlyResetRemainingMs.value = 0
   resetStage.value = 'ended'
   canCompleteReset.value = true
   resetIsPlaying.value = false
   resetNotice.value = '复位完成，可以回到工作。'
+}
+
+function onVideoEnded() {
+  if (resetStage.value === 'fallback') return
+  finalizeResetPlayback()
 }
 
 function onVideoError() {
@@ -787,27 +1102,78 @@ function clearReminderEmergencyHold() {
   }
 }
 
-function startFallback() {
-  resetStage.value = 'fallback'
+function stopResetVideoSource() {
+  const video = videoRef.value
+  if (!video) return
+  video.pause()
+  video.removeAttribute('autoplay')
+  video.removeAttribute('src')
+  video.load()
+  resetIsPlaying.value = false
+}
+
+function clearFallbackTimer() {
+  if (fallbackHandle) {
+    window.clearInterval(fallbackHandle)
+    fallbackHandle = null
+  }
+}
+
+function startDefaultRestTimer() {
+  clearFallbackTimer()
+  fallbackRemaining.value = getDefaultRestDurationSeconds()
   canCompleteReset.value = false
+  fallbackHandle = window.setInterval(() => {
+    fallbackRemaining.value = Math.max(0, fallbackRemaining.value - 1)
+    if (fallbackRemaining.value <= 0) {
+      clearFallbackTimer()
+      canCompleteReset.value = true
+      resetNotice.value = '默认休息完成，可以回到工作。'
+    }
+  }, 1000)
+}
+
+function startFallback() {
+  if (
+    resetMediaFailureHandled ||
+    resetStage.value === 'fallback' ||
+    resetStage.value === 'ended' ||
+    resetStage.value === 'empty'
+  ) {
+    return
+  }
+  resetMediaFailureHandled = true
+  stopResetVideoSource()
+  resetStage.value = 'fallback'
+  updateEarlyResetAvailability()
+  if (earlyResetRemainingMs.value > 0) {
+    canCompleteReset.value = false
+  }
   fallbackRemaining.value = Math.max(15, (resetPayload.value?.settings.resetMinutes || 1) * 60)
   resetNotice.value = '视频无法播放，等待结束后可返回。'
-  if (fallbackHandle) window.clearInterval(fallbackHandle)
+  clearFallbackTimer()
   fallbackHandle = window.setInterval(() => {
     fallbackRemaining.value -= 1
     if (fallbackRemaining.value <= 0) {
-      if (fallbackHandle) window.clearInterval(fallbackHandle)
-      fallbackHandle = null
-      onVideoEnded()
+      clearFallbackTimer()
+      finalizeResetPlayback()
     }
   }, 1000)
 }
 
 async function completeReset() {
   if (!canCompleteReset.value) return
-  await window.bodyReset.completeReset({
+  const result = await window.bodyReset.completeReset({
     videoName: resetPayload.value?.video?.name || '',
+    videoEnded:
+      resetStage.value === 'ended' ||
+      resetStage.value === 'empty' ||
+      resetStage.value === 'text-rest',
   })
+  if (!result.completed && result.reason === 'not-ready') {
+    updateEarlyResetAvailability()
+    showToast('还没有达到可返回的复位时长')
+  }
 }
 
 function adjustResetVolume(direction: 1 | -1) {
@@ -882,6 +1248,18 @@ watch(
   },
 )
 
+watch(
+  () => settings.value.autoStartWhenUnlocked,
+  (enabled) => {
+    if (!mainStateLoaded) return
+    if (!enabled) {
+      clearAutoResume()
+      return
+    }
+    maybeAutoStartWhenUnlocked()
+  },
+)
+
 onMounted(() => {
   if (isReminderView) {
     loadReminderPayload()
@@ -898,8 +1276,14 @@ onMounted(() => {
   }
 
   loadMainState()
+  removeSleepReminderListener = window.bodyReset.onSleepReminderStarted(handleSleepReminderStarted)
   removeSuspendListener = window.bodyReset.onSystemSuspend(handleSystemSuspend)
   removeResumeListener = window.bodyReset.onSystemResume(handleSystemResume)
+  removeResumeFromSleepListener = window.bodyReset.onSystemResumeFromSleep(
+    handleSystemResumeFromSleep,
+  )
+  removeLockListener = window.bodyReset.onSystemLock(handleSystemLock)
+  removeUnlockListener = window.bodyReset.onSystemUnlock(handleSystemUnlock)
   removeResetListener = window.bodyReset.onResetCompleted((payload) => {
     remainingMs.value = totalFocusMs.value
     if (payload.todayStats) {
@@ -933,11 +1317,17 @@ onBeforeUnmount(() => {
     void queueSettingsSave({ ...baseSettings, [pending.key]: pending.value })
   }
   clearEmergencyHold()
-  if (fallbackHandle) window.clearInterval(fallbackHandle)
+  clearFallbackTimer()
   if (toastHandle) window.clearTimeout(toastHandle)
   if (removeResetListener) removeResetListener()
+  if (removeSleepReminderListener) removeSleepReminderListener()
   if (removeSuspendListener) removeSuspendListener()
   if (removeResumeListener) removeResumeListener()
+  if (removeResumeFromSleepListener) removeResumeFromSleepListener()
+  if (removeLockListener) removeLockListener()
+  if (removeUnlockListener) removeUnlockListener()
+  clearAutoResume()
+  clearEarlyResetTimer()
   document.removeEventListener('keydown', onResetKeyDown, true)
   document.removeEventListener('keyup', onResetKeyUp, true)
   document.removeEventListener('keydown', onReminderKeyDown, true)
@@ -948,6 +1338,12 @@ onBeforeUnmount(() => {
 
 <template>
   <main v-if="!isResetView && !isReminderView" class="app-shell">
+    <div v-if="isPreviewMode" class="runtime-warning preview-warning">
+      当前是界面预览，不会读取本地配置、视频或自动倒计时。请双击“便携版/身体复位提醒器.exe”。
+    </div>
+    <div v-if="stateLoadError" class="runtime-warning error-warning">
+      {{ stateLoadError }}
+    </div>
     <section class="focus-surface" aria-label="专注计时">
       <div class="topbar">
         <div class="brand-block">
@@ -1172,17 +1568,40 @@ onBeforeUnmount(() => {
 
             <div class="rule-card">
               <strong>按星期自动选视频</strong>
-              <span>在总文件夹里建“周一到周五”和“周末”，或建“周一”“周二”等每天专属文件夹。当天专属优先。</span>
+              <span>在总文件夹里建“周一到周五”和“周末”，或建“周一”“周二”等每天专属文件夹。当天专属优先，根目录视频会和当天文件夹一起播放。</span>
               <em>{{ baseVideoFolderPath || '正在准备总文件夹' }}</em>
             </div>
 
             <label class="toggle-row">
               <span>
                 <strong>严格模式</strong>
-                <small>视频结束前不能完成</small>
+                <small>复位窗口不允许直接关闭</small>
               </span>
               <input v-model="settings.strictMode" type="checkbox" @change="saveSettings" />
             </label>
+
+            <label class="toggle-row">
+              <span>
+                <strong>允许提前结束普通复位</strong>
+                <small>达到设定时长后即可回到工作，不必等视频结束</small>
+              </span>
+              <input v-model="settings.earlyResetEnabled" type="checkbox" @change="saveSettings" />
+            </label>
+
+            <div class="setting-group" :class="{ disabled: !settings.earlyResetEnabled }">
+              <label class="setting-row">
+                <span>最短复位时长</span>
+                <input
+                  v-model.number="settings.earlyResetMinutes"
+                  type="number"
+                  min="1"
+                  max="60"
+                  @change="onEarlyResetMinutesChange"
+                />
+                <small>分钟</small>
+              </label>
+              <p class="setting-help">例如设置为 3 分钟，普通复位开始 3 分钟后就可以提前返回。</p>
+            </div>
 
             <label class="toggle-row">
               <span>
@@ -1205,16 +1624,19 @@ onBeforeUnmount(() => {
                 </label>
               </div>
               <label class="setting-row">
-                <span>提醒间隔</span>
+                <span>首次提醒间隔</span>
                 <input
                   v-model.number="settings.sleepReminderInterval"
                   type="number"
-                  min="5"
-                  max="240"
+                  min="1"
+                  max="5"
                   @change="onSleepReminderIntervalChange"
                 />
                 <small>分钟</small>
               </label>
+              <p class="setting-help">
+                首次间隔最多 5 分钟；第一次提醒后，后续每 1 分钟再次提醒，直到离开电脑。
+              </p>
               <button class="wide-button" type="button" @click="openSleepReminderFolder">
                 <FolderOpen :size="18" />
                 <span>打开睡眠提醒视频（{{ sleepReminderVideoCount }} 个）</span>
@@ -1238,6 +1660,22 @@ onBeforeUnmount(() => {
                 <small>跟随系统自动打开</small>
               </span>
               <input v-model="settings.autoStart" type="checkbox" @change="saveSettings" />
+            </label>
+
+            <label class="toggle-row">
+              <span>
+                <strong>解锁后自动开始</strong>
+                <small>电脑保持解锁时自动开始；手动暂停 5 分钟后会自动恢复</small>
+              </span>
+              <input v-model="settings.autoStartWhenUnlocked" type="checkbox" @change="saveSettings" />
+            </label>
+
+            <label class="toggle-row">
+              <span>
+                <strong>睡眠唤醒后自动启动</strong>
+                <small>Windows 从睡眠恢复时单独启动本程序，并检查是否需要开启倒计时</small>
+              </span>
+              <input v-model="settings.autoStartAfterSleep" type="checkbox" @change="saveSettings" />
             </label>
 
             <div class="setting-group external-log-group">
@@ -1300,7 +1738,7 @@ onBeforeUnmount(() => {
       ref="videoRef"
       class="reset-video"
       :src="resetPayload.video.url"
-      autoplay
+      :autoplay="resetStage === 'playing'"
       playsinline
       @click="toggleResetVideo"
       @play="resetIsPlaying = true"
@@ -1309,19 +1747,26 @@ onBeforeUnmount(() => {
       @error="onVideoError"
     ></video>
 
-    <section v-if="resetStage === 'empty'" class="empty-reset">
+    <section v-if="resetStage === 'text-rest'" class="empty-reset text-rest-reset">
       <div class="empty-reset-inner">
         <ShieldCheck :size="30" />
-        <h1>还没有复位视频</h1>
-        <p>把 mp4、mov、wmv、avi、mkv 或 m4v 放进视频文件夹。</p>
+        <h1>没有复位视频，先做默认休息</h1>
+        <p class="default-rest-message">{{ defaultRestMessage }}</p>
+        <p>视频文件夹目前为空。请先离开电脑活动一下，默认休息结束后即可回到工作。</p>
+        <div class="default-rest-countdown">{{ formatTime(fallbackRemaining * 1000) }}</div>
         <div class="reset-actions">
           <button class="secondary-button light" type="button" @click="openVideoFolder">
             <FolderOpen :size="18" />
             <span>打开文件夹</span>
           </button>
-          <button class="primary-button light" type="button" @click="completeReset">
+          <button
+            class="primary-button light"
+            type="button"
+            :disabled="!canCompleteReset"
+            @click="completeReset"
+          >
             <Check :size="18" />
-            <span>返回工作</span>
+            <span>{{ resetButtonText }}</span>
           </button>
         </div>
       </div>
@@ -1338,10 +1783,13 @@ onBeforeUnmount(() => {
       <span>开始播放</span>
     </button>
 
-    <div v-if="resetStage !== 'empty'" class="reset-chrome">
+    <div v-if="resetStage !== 'empty' && resetStage !== 'text-rest'" class="reset-chrome">
       <div class="reset-copy">
         <p>{{ resetNotice }}</p>
         <strong v-if="resetVideoName">{{ resetVideoName }}</strong>
+        <small v-if="resetPayload?.settings.earlyResetEnabled && !canCompleteReset">
+          达到 {{ resetPayload.settings.earlyResetMinutes }} 分钟后可提前返回工作
+        </small>
       </div>
 
       <button class="complete-button" type="button" :disabled="!canCompleteReset" @click="completeReset">
@@ -1381,7 +1829,7 @@ onBeforeUnmount(() => {
       <div class="reminder-copy">
         <span class="reminder-kicker">睡眠提醒</span>
         <h1>该睡觉了，先把身体放回去。</h1>
-        <p>视频会循环播放，只有长按 Esc 才能紧急退出。退出后 5 分钟，如果电脑仍在使用，会再次提醒。</p>
+        <p>视频会循环播放，只有长按 Esc 才能紧急退出。第一次退出后 1 分钟，如果电脑仍在使用，会再次提醒。</p>
       </div>
       <div class="reminder-actions">
         <div class="reminder-media-controls">

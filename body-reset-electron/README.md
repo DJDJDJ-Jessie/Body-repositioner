@@ -27,6 +27,8 @@ npm run dist:folder
 
 The build output is created in `release/win-unpacked/`. After packaging, copy the generated files into the root `便携版/` folder for delivery, while preserving `videos/`, `data/`, and `使用说明.md`.
 
+The formal launch entry is `便携版/身体复位提醒器.exe`. The `release/win-unpacked/` directory is a staging output. If it is opened inside this workspace, the app reuses the existing `便携版/data` folder; a browser/Vite preview is only a UI mock and does not load real settings or videos.
+
 The single-file portable target still exists as `npm run dist`, but it is not the default delivery shape because it self-extracts on launch and starts more slowly.
 
 ## Runtime folders
@@ -41,6 +43,8 @@ videos/
 data/
 ```
 
-Users only need to place reset videos in `videos/`. They can also create weekday folders such as `周一到周五`, `周末`, or day-specific folders such as `周一`, `周二`, etc. The app chooses day-specific folders first, then weekday/weekend folders, then the root `videos/` folder.
+Users only need to place reset videos in `videos/`. They can also create weekday folders such as `周一到周五`, `周末`, or day-specific folders such as `周一`, `周二`, etc. The app chooses day-specific folders first, then weekday/weekend folders; videos directly inside the root `videos/` folder are shared and added to the selected subfolder's playlist. If no matching subfolder exists, only the root folder is used.
+
+If the reset video library is empty, the app uses a built-in text rest flow (“喝口水，起来动感一下”) instead of allowing an immediate return. Sleep reminder windows are closed when Windows enters sleep or locks, and the reminder schedule starts a fresh interval after the computer becomes active again.
 
 Settings, playback state, and logs are managed by the app UI.
